@@ -1,15 +1,14 @@
--- LUAU-OL :: Funky Friday Auto Player
--- Automatically hits notes in Funky Friday using VirtualInputManager.
--- [F1] toggle UI, [F2] unload. MIT.
+-- LUAU-OL :: Funky Friday Auto Player (Fixed)
+-- Manual side selection, downscroll toggle, corrected keybind text reading.
+-- [F1] UI, [F2] unload. MIT.
 
 local CONFIG = {
     Enabled = true,
     AutoPlay = false,
-    Side = nil,                -- "Left" or "Right"; auto-detected on start
-    Accuracy = 0.4,            -- 0.0 = early, 1.0 = late (note Y threshold)
-    Humanization = false,      -- randomise the threshold slightly
-    HumanizeRange = 0.05,      -- max ± range in scale units
-    HoldLongNotes = true,      -- keep key held for hold notes
+    Side = nil,                -- MUST be set to "Left" or "Right" before enabling
+    Downscroll = true,         -- Set false if you use upscroll
+    Accuracy = 0.4,
+    HoldLongNotes = true,
     KeyToggle = Enum.KeyCode.F3,
 }
 
@@ -22,70 +21,32 @@ local player = Players.LocalPlayer
 local playerGui = player:WaitForChild("PlayerGui")
 local isMobile = UserInputService.TouchEnabled and not UserInputService.MouseEnabled
 
--- ============================================================
--- STATE & TRACKING
--- ============================================================
 local State = {
     enabled = false,
-    side = nil,
+    side = CONFIG.Side,
     columns = {},
     keymap = {},
-    keyState = {},             -- per-column pressed flag
+    keyState = {},
     connection = nil,
     unloaded = false,
 }
 
 local Connections = {}
+local function addConnection(c) table.insert(Connections, c); return c end
 
-local function addConnection(c)
-    table.insert(Connections, c)
-    return c
+-- Probe VirtualInputManager
+local hasVIM = pcall(function() return VirtualInputManager.SendKeyEvent ~= nil end)
+if not hasVIM then
+    warn("[FF] VirtualInputManager locked by executor. Auto Play will not work.")
 end
 
 -- ============================================================
--- API PROBE
--- ============================================================
-local hasVirtualInputManager = pcall(function()
-    return VirtualInputManager.SendKeyEvent ~= nil
-end)
-if not hasVirtualInputManager then
-    warn("[FF] VirtualInputManager unavailable — Auto Player cannot send key events.")
-end
-
--- ============================================================
--- SIDE DETECTION
--- ============================================================
-local function detectSide()
-    local char = player.Character
-    local root = char and char:FindFirstChild("HumanoidRootPart")
-    if not root then return nil end
-
-    local map = workspace:FindFirstChild("Map")
-    if not map then return nil end
-    local stages = map:FindFirstChild("Stages")
-    if not stages then return nil end
-
-    for _, stage in ipairs(stages:GetChildren()) do
-        local teams = stage:FindFirstChild("Teams")
-        if teams then
-            for _, sideName in ipairs({"Left", "Right"}) do
-                local pad = teams:FindFirstChild(sideName)
-                if pad and (root.Position - pad.Position).Magnitude <= 5 then
-                    return sideName
-                end
-            end
-        end
-    end
-    return nil
-end
-
--- ============================================================
--- CACHE COLUMNS & KEYBINDS
+-- CACHE LOGIC (REQUIRES SIDE TO BE SET)
 -- ============================================================
 local function cacheColumns()
     if not State.side then return false end
-    local window = playerGui:FindFirstChild("Window")
-    if not window then return false end
+    local ok, window = pcall(function() return playerGui:FindFirstChild("Window") end)
+    if not ok or not window then return false end
     local gameGui = window:FindFirstChild("Game")
     if not gameGui then return false end
     local fields = gameGui:FindFirstChild("Fields")
@@ -100,9 +61,7 @@ local function cacheColumns()
         local lane = inner:FindFirstChild("Lane" .. i)
         if lane then
             local notes = lane:FindFirstChild("Notes")
-            if notes then
-                State.columns[i] = notes
-            end
+            if notes then State.columns[i] = notes end
         end
     end
     return next(State.columns) ~= nil
@@ -110,8 +69,8 @@ end
 
 local function cacheKeybinds()
     if not State.side then return false end
-    local window = playerGui:FindFirstChild("Window")
-    if not window then return false end
+    local ok, window = pcall(function() return playerGui:FindFirstChild("Window") end)
+    if not ok or not window then return false end
     local gameGui = window:FindFirstChild("Game")
     if not gameGui then return false end
     local fields = gameGui:FindFirstChild("Fields")
@@ -129,12 +88,15 @@ local function cacheKeybinds()
             if labels then
                 local label = labels:FindFirstChild("Label")
                 if label and label:IsA("TextLabel") then
-                    local keyName = label.Text
-                    local ok, keyCode = pcall(function()
-                        return Enum.KeyCode[keyName]
-                    end)
-                    if ok then
-                        State.keymap[i] = keyCode
+                    -- Funky Friday sometimes nests text or uses different casing
+                    local keyText = label.Text
+                    if not keyText or keyText == "" then
+                        local textChild = label:FindFirstChildWhichIsA("TextLabel")
+                        if textChild then keyText = textChild.Text end
+                    end
+                    if keyText then
+                        local ok2, keyCode = pcall(function() return Enum.KeyCode[keyText:upper()] end)
+                        if ok2 and keyCode then State.keymap[i] = keyCode end
                     end
                 end
             end
@@ -144,47 +106,52 @@ local function cacheKeybinds()
 end
 
 -- ============================================================
--- AUTOPLAY LOGIC
+-- AUTOPLAY LOGIC (SCROLL DIRECTION AWARE)
 -- ============================================================
 local function autoplayStep()
-    if not State.enabled or not State.side then return end
-    if not hasVirtualInputManager then return end
+    if not State.enabled or not hasVIM then return end
 
     local threshold = CONFIG.Accuracy
-    if CONFIG.Humanization then
-        threshold = threshold + (math.random() - 0.5) * CONFIG.HumanizeRange
+    -- For downscroll, notes scroll from top to bottom (Y increases).
+    -- For upscroll, notes scroll from bottom to top (Y decreases).
+    -- We adjust the comparison accordingly.
+    local function isNoteReady(yScale)
+        if CONFIG.Downscroll then
+            return yScale > threshold
+        else
+            return yScale < (1 - threshold)
+        end
     end
-    threshold = math.clamp(threshold, 0, 1)
 
     for col, notes in pairs(State.columns) do
         local key = State.keymap[col]
-        if not key then continue end
+        if key then
+            for _, note in ipairs(notes:GetChildren()) do
+                if note:IsA("GuiObject") then
+                    local y = note.Position.Y.Scale
+                    if isNoteReady(y) then
+                        -- Press down if not already
+                        if not State.keyState[col] then
+                            VirtualInputManager:SendKeyEvent(true, key, false, game)
+                            State.keyState[col] = true
+                        end
 
-        for _, note in ipairs(notes:GetChildren()) do
-            if note:IsA("GuiObject") then
-                local y = note.Position.Y.Scale
-                if y > threshold then
-                    -- Press down if not already
-                    if not State.keyState[col] then
-                        VirtualInputManager:SendKeyEvent(true, key, false, game)
-                        State.keyState[col] = true
-                    end
-
-                    -- Hold note: wait until it passes, then release
-                    if CONFIG.HoldLongNotes and #note:GetChildren() >= 2 then
-                        task.spawn(function()
-                            while note.Parent and note.Position.Y.Scale > threshold and State.enabled do
-                                RunService.Heartbeat:Wait()
-                            end
-                            if State.keyState[col] then
-                                VirtualInputManager:SendKeyEvent(false, key, false, game)
-                                State.keyState[col] = false
-                            end
-                        end)
-                    else
-                        -- Tap note: release immediately
-                        VirtualInputManager:SendKeyEvent(false, key, false, game)
-                        State.keyState[col] = false
+                        -- Hold note check (uses child count as heuristic)
+                        if CONFIG.HoldLongNotes and #note:GetChildren() >= 2 then
+                            task.spawn(function()
+                                while note.Parent and isNoteReady(note.Position.Y.Scale) and State.enabled do
+                                    RunService.Heartbeat:Wait()
+                                end
+                                if State.keyState[col] then
+                                    VirtualInputManager:SendKeyEvent(false, key, false, game)
+                                    State.keyState[col] = false
+                                end
+                            end)
+                        else
+                            -- Tap note: release immediately
+                            VirtualInputManager:SendKeyEvent(false, key, false, game)
+                            State.keyState[col] = false
+                        end
                     end
                 end
             end
@@ -197,31 +164,13 @@ end
 -- ============================================================
 local function startAutoPlay()
     if State.enabled then return end
-    if not hasVirtualInputManager then
-        warn("[FF] Cannot start — VirtualInputManager missing.")
-        return
-    end
-
-    -- Detect side if not set
+    if not hasVIM then warn("[FF] VirtualInputManager unavailable."); return end
     if not State.side then
-        local detected = detectSide()
-        if detected then
-            State.side = detected
-        else
-            warn("[FF] Could not detect side. Stand on the Left or Right pad and try again.")
-            return
-        end
-    end
-
-    -- Cache lanes and keys
-    if not cacheColumns() then
-        warn("[FF] Could not find note lanes for side:", State.side)
+        warn("[FF] Side not set. Choose Left or Right in the UI first.")
         return
     end
-    if not cacheKeybinds() then
-        warn("[FF] Could not read keybinds for side:", State.side)
-        return
-    end
+    if not cacheColumns() then warn("[FF] Could not find note lanes for side:", State.side); return end
+    if not cacheKeybinds() then warn("[FF] Could not read keybinds for side:", State.side); return end
 
     State.enabled = true
     State.keyState = {}
@@ -234,12 +183,9 @@ local function stopAutoPlay()
         pcall(function() State.connection:Disconnect() end)
         State.connection = nil
     end
-    -- Release any held keys
     for col, pressed in pairs(State.keyState) do
         if pressed and State.keymap[col] then
-            pcall(function()
-                VirtualInputManager:SendKeyEvent(false, State.keymap[col], false, game)
-            end)
+            pcall(function() VirtualInputManager:SendKeyEvent(false, State.keymap[col], false, game) end)
         end
     end
     State.keyState = {}
@@ -460,7 +406,14 @@ makeToggle(SettingsCard, "Hold Long Notes", "Keeps keys held down for hold notes
     CONFIG.HoldLongNotes = v
 end)
 
--- Precision card
+-- Scroll Direction Card
+local ScrollCard = makeCard("✦ SCROLL DIRECTION", 44 + ROW)
+
+makeToggle(ScrollCard, "Downscroll", "Turn OFF if your notes scroll upwards.", 44, CONFIG.Downscroll, function(v)
+    CONFIG.Downscroll = v
+end)
+
+-- Precision Card
 local PrecisionCard = makeCard("✦ PRECISION", 44 + 70)
 
 local precisionLabel = Instance.new("TextLabel")
@@ -496,29 +449,25 @@ precisionBox.FocusLost:Connect(function()
     end
 end)
 
-local HumanizeCard = makeCard("✦ HUMANIZATION", 44 + ROW)
-
-makeToggle(HumanizeCard, "Humanization", "Randomises press timing slightly.", 44, CONFIG.Humanization, function(v)
-    CONFIG.Humanization = v
-end)
-
--- Side card
-local SideCard = makeCard("✦ SIDE", 44 + 44)
+-- Side Selection Card (MANDATORY)
+local SideCard = makeCard("✦ SIDE (SELECT FIRST)", 44 + 44)
 
 local sideLabel = Instance.new("TextLabel")
 sideLabel.Size = UDim2.new(1, -20, 0, 30)
 sideLabel.Position = UDim2.new(0, 10, 0, 44)
 sideLabel.BackgroundTransparency = 1
-sideLabel.Text = "Side: Auto-detect"
-sideLabel.TextColor3 = Theme.Text
-sideLabel.Font = Enum.Font.Gotham
+sideLabel.Text = "Side: NOT SET"
+sideLabel.TextColor3 = Theme.Accent
+sideLabel.Font = Enum.Font.GothamBold
 sideLabel.TextSize = 14
 sideLabel.TextXAlignment = Enum.TextXAlignment.Left
 sideLabel.Parent = SideCard
 
 local function setSide(s)
     State.side = s
+    CONFIG.Side = s
     sideLabel.Text = "Side: " .. s
+    sideLabel.TextColor3 = Theme.Text
 end
 
 local leftBtn = Instance.new("TextButton")
@@ -617,4 +566,4 @@ end))
 -- ============================================================
 -- STARTUP
 -- ============================================================
-print("[FF] Auto Player loaded. VirtualInputManager:", hasVirtualInputManager, "Mobile:", isMobile)
+print("[FF] Auto Player loaded. VirtualInputManager:", hasVIM, "Mobile:", isMobile)
