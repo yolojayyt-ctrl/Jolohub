@@ -1,16 +1,26 @@
--- LUAU-OL :: AOTR Jolo Hub (Mobile/Delta)
--- Player-side combat automation + titan ESP for Attack on Titan Revolution.
--- Touch-sized UI, BillboardGui ESP, Tool:Activate combat. No Drawing/getconnections needed.
--- Float button toggles UI on mobile. [F2] unloads. MIT.
+-- LUAU-OL :: AOTR Jolo Hub (v1.2)
+-- Player-side combat + ODM quality-of-life for Attack on Titan Revolution.
+-- Kill Aura uses Tool:Activate (game's own combat path). ESP uses BillboardGui.
+-- Mobile touch UI, Delta-friendly. [F1] toggle UI, [F2] unload. MIT.
 
 local CONFIG = {
     Enabled = true,
     -- Combat
     KillAura = false,
     KillAuraRange = 100,
-    KillAuraInterval = 0.15,
+    KillAuraInterval = 0.2,
+    FaceTarget = true,
     AutoReloadBlades = false,
     ReloadInterval = 2.5,
+    -- ODM (perk-based — may no-op if game doesn't expose these)
+    InfiniteGas = false,
+    InfiniteBoost = false,
+    NoHookCooldown = false,
+    InstantHook = false,
+    -- Movement
+    WalkSpeed = 16,
+    JumpPower = 50,
+    ApplyMovement = false,
     -- Visuals
     TitanESP = false,
     ESPColor = Color3.fromRGB(245, 194, 17),
@@ -27,20 +37,17 @@ local Workspace = game:GetService("Workspace")
 local player = Players.LocalPlayer
 local playerGui = player:WaitForChild("PlayerGui")
 
--- Mobile detection (works on Delta mobile and Studio phone emulator)
 local isMobile = UserInputService.TouchEnabled and not UserInputService.MouseEnabled
 
--- ============================================================
--- STATE & TRACKING
--- ============================================================
 local Connections = {}
 local ESP_TAGS = {}
 local Unloaded = false
 
-local function addConnection(c)
-    table.insert(Connections, c)
-    return c
-end
+local function addConnection(c) table.insert(Connections, c); return c end
+
+-- API probes
+local hasVirtualUser = pcall(function() return VirtualUser.Button2Down ~= nil end)
+if not hasVirtualUser then warn("[AOTR] VirtualUser unavailable - Anti-AFK may not fire.") end
 
 -- ============================================================
 -- HELPERS
@@ -102,9 +109,10 @@ local function getBladeTool()
 end
 
 -- ============================================================
--- COMBAT (Tool:Activate — same path as a real tap)
+-- COMBAT — Tool:Activate is the path the game itself uses
 -- ============================================================
 local function faceTarget(target)
+    if not CONFIG.FaceTarget then return end
     local root = getRoot()
     local hrp = target:FindFirstChild("HumanoidRootPart")
     if root and hrp then
@@ -142,11 +150,9 @@ local function reloadLoop()
     while CONFIG.Enabled and not Unloaded do
         if CONFIG.AutoReloadBlades then
             local char = getChar()
-            local hum = getHumanoid()
             local blade = getBladeTool()
-            if char and hum and blade then
+            if char and blade then
                 pcall(function()
-                    -- Move to backpack then back to character forces a re-equip + reload
                     local backpack = player:FindFirstChildOfClass("Backpack")
                     if backpack then
                         blade.Parent = backpack
@@ -161,7 +167,63 @@ local function reloadLoop()
 end
 
 -- ============================================================
--- TITAN ESP (BillboardGui — no Drawing API needed)
+-- ODM (perk-based — honest fallback)
+-- ============================================================
+local function applyODM()
+    local hum = getHumanoid()
+    if not hum then return end
+    -- Try attributes first; if the game stores stats elsewhere these will no-op.
+    if CONFIG.InfiniteGas then
+        pcall(function()
+            hum:SetAttribute("Gas", 1e9)
+            local char = getChar()
+            if char then char:SetAttribute("Gas", 1e9) end
+        end)
+    end
+    if CONFIG.InfiniteBoost then
+        pcall(function()
+            hum:SetAttribute("Boost", 1e9)
+        end)
+    end
+    if CONFIG.NoHookCooldown then
+        pcall(function()
+            hum:SetAttribute("HookCooldown", 0)
+        end)
+    end
+    if CONFIG.InstantHook then
+        pcall(function()
+            hum:SetAttribute("HookSpeed", 999)
+        end)
+    end
+end
+
+local function odmLoop()
+    while CONFIG.Enabled and not Unloaded do
+        applyODM()
+        task.wait(0.5)
+    end
+end
+
+-- ============================================================
+-- MOVEMENT
+-- ============================================================
+local function movementLoop()
+    while CONFIG.Enabled and not Unloaded do
+        if CONFIG.ApplyMovement then
+            local hum = getHumanoid()
+            if hum then
+                pcall(function()
+                    hum.WalkSpeed = CONFIG.WalkSpeed
+                    hum.JumpPower = CONFIG.JumpPower
+                end)
+            end
+        end
+        task.wait(0.5)
+    end
+end
+
+-- ============================================================
+-- TITAN ESP (BillboardGui — no Drawing dependency)
 -- ============================================================
 local function clearESP()
     for _, tag in pairs(ESP_TAGS) do
@@ -186,7 +248,7 @@ local function updateESP()
             if not existing or not existing.Parent then
                 local billboard = Instance.new("BillboardGui")
                 billboard.Name = "AOTR_ESP"
-                billboard.Size = UDim2.new(0, 120, 0, 36)
+                billboard.Size = UDim2.new(0, 120, 0, 32)
                 billboard.StudsOffset = Vector3.new(0, 3, 0)
                 billboard.AlwaysOnTop = true
                 billboard.LightInfluence = 0
@@ -195,12 +257,11 @@ local function updateESP()
                 local label = Instance.new("TextLabel")
                 label.Size = UDim2.new(1, 0, 1, 0)
                 label.BackgroundColor3 = Color3.fromRGB(0, 0, 0)
-                label.BackgroundTransparency = 0.45
+                label.BackgroundTransparency = 0.4
                 label.TextColor3 = CONFIG.ESPColor
                 label.Text = titan.Name
                 label.Font = Enum.Font.GothamBold
                 label.TextSize = 14
-                label.TextScaled = false
                 label.Parent = billboard
                 Instance.new("UICorner", label).CornerRadius = UDim.new(0, 4)
 
@@ -229,7 +290,7 @@ local function espLoop()
 end
 
 -- ============================================================
--- ANTI-AFK (VirtualUser — works on Delta + mobile)
+-- ANTI-AFK
 -- ============================================================
 local function setupAntiAFK()
     addConnection(player.Idled:Connect(function()
@@ -263,8 +324,8 @@ local Theme = {
 }
 
 local viewport = Workspace.CurrentCamera and Workspace.CurrentCamera.ViewportSize or Vector2.new(800, 600)
-local FRAME_W = isMobile and math.clamp(viewport.X - 24, 300, 560) or 650
-local FRAME_H = isMobile and math.clamp(viewport.Y - 60, 340, 520) or 450
+local FRAME_W = isMobile and math.clamp(viewport.X - 20, 300, 560) or 680
+local FRAME_H = isMobile and math.clamp(viewport.Y - 50, 360, 540) or 500
 local ROW_H = isMobile and 52 or 40
 local SHOW_SIDEBAR = not isMobile
 local SIDEBAR_W = SHOW_SIDEBAR and 160 or 0
@@ -290,7 +351,6 @@ MainStroke.Color = Theme.Line
 MainStroke.Thickness = 1
 MainStroke.Parent = MainFrame
 
--- Drag helper
 local function makeDraggable(gui, handle)
     local dragging, dragInput, dragStart, startPos
     addConnection(handle.InputBegan:Connect(function(input)
@@ -323,7 +383,6 @@ local function makeDraggable(gui, handle)
     end))
 end
 
--- Top bar
 local TopBar = Instance.new("Frame")
 TopBar.Size = UDim2.new(1, 0, 0, 44)
 TopBar.BackgroundTransparency = 1
@@ -348,13 +407,11 @@ CloseBtn.Text = "X"
 CloseBtn.TextColor3 = Theme.Text
 CloseBtn.Font = Enum.Font.GothamBold
 CloseBtn.TextSize = 16
-CloseBtn.AutoButtonColor = true
 CloseBtn.Parent = TopBar
 Instance.new("UICorner", CloseBtn).CornerRadius = UDim.new(0, 6)
 
 makeDraggable(MainFrame, TopBar)
 
--- Sidebar (desktop only)
 if SHOW_SIDEBAR then
     local Sidebar = Instance.new("Frame")
     Sidebar.Size = UDim2.new(0, SIDEBAR_W, 1, -54)
@@ -379,7 +436,7 @@ if SHOW_SIDEBAR then
     VersionTag.Size = UDim2.new(0, 34, 0, 16)
     VersionTag.Position = UDim2.new(0, 88, 0, 12)
     VersionTag.BackgroundColor3 = Theme.Accent
-    VersionTag.Text = "v1.1"
+    VersionTag.Text = "v1.2"
     VersionTag.TextColor3 = Color3.new(0, 0, 0)
     VersionTag.Font = Enum.Font.GothamBold
     VersionTag.TextSize = 10
@@ -423,7 +480,6 @@ if SHOW_SIDEBAR then
     CreateSidebarButton("Missions", false, false)
 end
 
--- Content
 local ContentArea = Instance.new("ScrollingFrame")
 ContentArea.Size = UDim2.new(1, -(SIDEBAR_W + 20), 1, -54)
 ContentArea.Position = UDim2.new(0, SIDEBAR_W + 10, 0, 48)
@@ -503,7 +559,6 @@ local function CreateToggle(parent, nameText, descText, yPos, initialState, call
     desc.Parent = row
 
     local state = initialState and true or false
-
     local SW_W = isMobile and 46 or 36
     local SW_H = isMobile and 22 or 18
     local DOT = isMobile and 18 or 14
@@ -517,18 +572,14 @@ local function CreateToggle(parent, nameText, descText, yPos, initialState, call
 
     local switchDot = Instance.new("Frame")
     switchDot.Size = UDim2.new(0, DOT, 0, DOT)
-    switchDot.Position = state
-        and UDim2.new(1, -(DOT + 2), 0.5, -DOT / 2)
-        or UDim2.new(0, 2, 0.5, -DOT / 2)
+    switchDot.Position = state and UDim2.new(1, -(DOT + 2), 0.5, -DOT / 2) or UDim2.new(0, 2, 0.5, -DOT / 2)
     switchDot.BackgroundColor3 = Theme.Background
     switchDot.Parent = switchBg
     Instance.new("UICorner", switchDot).CornerRadius = UDim.new(1, 0)
 
     local function render()
         switchBg.BackgroundColor3 = state and Theme.Accent or Theme.ToggleOff
-        switchDot.Position = state
-            and UDim2.new(1, -(DOT + 2), 0.5, -DOT / 2)
-            or UDim2.new(0, 2, 0.5, -DOT / 2)
+        switchDot.Position = state and UDim2.new(1, -(DOT + 2), 0.5, -DOT / 2) or UDim2.new(0, 2, 0.5, -DOT / 2)
     end
 
     row.MouseButton1Click:Connect(function()
@@ -538,12 +589,28 @@ local function CreateToggle(parent, nameText, descText, yPos, initialState, call
     end)
 end
 
--- FARM
-local FarmCard = CreateCard("✦ FARM", 2)
-CreateToggle(FarmCard, "Kill Aura", "Faces and swings at the nearest titan.", 44, CONFIG.KillAura,
+-- COMBAT
+local CombatCard = CreateCard("✦ COMBAT", 2)
+CreateToggle(CombatCard, "Kill Aura", "Faces and swings at the nearest titan.", 44, CONFIG.KillAura,
     function(v) CONFIG.KillAura = v end)
-CreateToggle(FarmCard, "Auto Reload Blades", "Re-equips your blade to trigger reload.", 44 + ROW_H + 6, CONFIG.AutoReloadBlades,
+CreateToggle(CombatCard, "Auto Reload Blades", "Re-equips your blade to trigger reload.", 44 + ROW_H + 6, CONFIG.AutoReloadBlades,
     function(v) CONFIG.AutoReloadBlades = v end)
+
+-- ODM
+local ODMCard = CreateCard("✦ ODM (perk-based)", 4)
+CreateToggle(ODMCard, "Infinite Gas", "Attempts to max gas via attribute.", 44, CONFIG.InfiniteGas,
+    function(v) CONFIG.InfiniteGas = v end)
+CreateToggle(ODMCard, "Infinite Boost", "Attempts to max boost via attribute.", 44 + ROW_H + 6, CONFIG.InfiniteBoost,
+    function(v) CONFIG.InfiniteBoost = v end)
+CreateToggle(ODMCard, "No Hook Cooldown", "Attempts to zero hook cooldown attribute.", 44 + (ROW_H + 6) * 2, CONFIG.NoHookCooldown,
+    function(v) CONFIG.NoHookCooldown = v end)
+CreateToggle(ODMCard, "Instant Hook", "Attempts to raise hook speed attribute.", 44 + (ROW_H + 6) * 3, CONFIG.InstantHook,
+    function(v) CONFIG.InstantHook = v end)
+
+-- MOVEMENT
+local MoveCard = CreateCard("✦ MOVEMENT", 1)
+CreateToggle(MoveCard, "Apply WalkSpeed / JumpPower", "Sets humanoid WalkSpeed and JumpPower.", 44, CONFIG.ApplyMovement,
+    function(v) CONFIG.ApplyMovement = v end)
 
 -- VISUALS
 local VisualCard = CreateCard("✦ VISUALS", 1)
@@ -555,9 +622,7 @@ local UtilCard = CreateCard("✦ UTILITY", 1)
 CreateToggle(UtilCard, "Anti-AFK", "Prevents idle kick via VirtualUser.", 44, CONFIG.AntiAFK,
     function(v) CONFIG.AntiAFK = v end)
 
--- ============================================================
 -- FLOAT BUTTON (mobile)
--- ============================================================
 if isMobile then
     local floatBtn = Instance.new("TextButton")
     floatBtn.Size = UDim2.new(0, 56, 0, 56)
@@ -638,7 +703,9 @@ end))
 -- ============================================================
 task.spawn(killAuraLoop)
 task.spawn(reloadLoop)
+task.spawn(odmLoop)
+task.spawn(movementLoop)
 task.spawn(espLoop)
 setupAntiAFK()
 
-print("[AOTR] Jolo Hub loaded. Mobile:", isMobile)
+print("[AOTR] Jolo Hub v1.2 loaded. Mobile:", isMobile)
