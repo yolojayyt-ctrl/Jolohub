@@ -1,12 +1,11 @@
--- LUAU-OL :: Funky Friday Auto Player (Fixed)
--- Manual side selection, downscroll toggle, corrected keybind text reading.
+-- LUAU-OL :: Funky Friday Auto Player (Thread-Elevated)
+-- Uses set_thread_identity to unlock VirtualInputManager. Forced downscroll.
 -- [F1] UI, [F2] unload. MIT.
 
 local CONFIG = {
     Enabled = true,
     AutoPlay = false,
-    Side = nil,                -- MUST be set to "Left" or "Right" before enabling
-    Downscroll = true,         -- Set false if you use upscroll
+    Side = nil,                -- MUST be "Left" or "Right"
     Accuracy = 0.4,
     HoldLongNotes = true,
     KeyToggle = Enum.KeyCode.F3,
@@ -21,6 +20,10 @@ local player = Players.LocalPlayer
 local playerGui = player:WaitForChild("PlayerGui")
 local isMobile = UserInputService.TouchEnabled and not UserInputService.MouseEnabled
 
+-- Probe for thread identity elevation
+local setThreadIdentity = setthreadidentity or set_thread_identity or syn and syn.set_thread_identity
+local hasThreadIdentity = pcall(function() return type(setThreadIdentity) == "function" end)
+
 local State = {
     enabled = false,
     side = CONFIG.Side,
@@ -34,19 +37,42 @@ local State = {
 local Connections = {}
 local function addConnection(c) table.insert(Connections, c); return c end
 
--- Probe VirtualInputManager
+-- Probe VIM
 local hasVIM = pcall(function() return VirtualInputManager.SendKeyEvent ~= nil end)
 if not hasVIM then
-    warn("[FF] VirtualInputManager locked by executor. Auto Play will not work.")
+    warn("[FF] VirtualInputManager unavailable. Script cannot send keys.")
 end
 
 -- ============================================================
--- CACHE LOGIC (REQUIRES SIDE TO BE SET)
+-- THREAD-ELEVATED KEY PRESS
+-- ============================================================
+local function sendKey(isDown, keyCode)
+    if not hasVIM then return false end
+    local ok = pcall(function()
+        if hasThreadIdentity then
+            setThreadIdentity(7)  -- Elevate to register input
+        end
+        VirtualInputManager:SendKeyEvent(isDown, keyCode, false, game)
+        if hasThreadIdentity then
+            setThreadIdentity(2)  -- Restore
+        end
+    end)
+    if not ok then
+        -- Fallback: try without elevation
+        pcall(function()
+            VirtualInputManager:SendKeyEvent(isDown, keyCode, false, game)
+        end)
+    end
+    return ok
+end
+
+-- ============================================================
+-- CACHE LOGIC (SIDE REQUIRED)
 -- ============================================================
 local function cacheColumns()
     if not State.side then return false end
-    local ok, window = pcall(function() return playerGui:FindFirstChild("Window") end)
-    if not ok or not window then return false end
+    local window = playerGui:FindFirstChild("Window")
+    if not window then return false end
     local gameGui = window:FindFirstChild("Game")
     if not gameGui then return false end
     local fields = gameGui:FindFirstChild("Fields")
@@ -69,8 +95,8 @@ end
 
 local function cacheKeybinds()
     if not State.side then return false end
-    local ok, window = pcall(function() return playerGui:FindFirstChild("Window") end)
-    if not ok or not window then return false end
+    local window = playerGui:FindFirstChild("Window")
+    if not window then return false end
     local gameGui = window:FindFirstChild("Game")
     if not gameGui then return false end
     local fields = gameGui:FindFirstChild("Fields")
@@ -88,15 +114,14 @@ local function cacheKeybinds()
             if labels then
                 local label = labels:FindFirstChild("Label")
                 if label and label:IsA("TextLabel") then
-                    -- Funky Friday sometimes nests text or uses different casing
                     local keyText = label.Text
                     if not keyText or keyText == "" then
                         local textChild = label:FindFirstChildWhichIsA("TextLabel")
                         if textChild then keyText = textChild.Text end
                     end
                     if keyText then
-                        local ok2, keyCode = pcall(function() return Enum.KeyCode[keyText:upper()] end)
-                        if ok2 and keyCode then State.keymap[i] = keyCode end
+                        local ok, keyCode = pcall(function() return Enum.KeyCode[keyText:upper()] end)
+                        if ok and keyCode then State.keymap[i] = keyCode end
                     end
                 end
             end
@@ -106,22 +131,12 @@ local function cacheKeybinds()
 end
 
 -- ============================================================
--- AUTOPLAY LOGIC (SCROLL DIRECTION AWARE)
+-- AUTOPLAY (FORCED DOWNSCROLL)
 -- ============================================================
 local function autoplayStep()
     if not State.enabled or not hasVIM then return end
 
     local threshold = CONFIG.Accuracy
-    -- For downscroll, notes scroll from top to bottom (Y increases).
-    -- For upscroll, notes scroll from bottom to top (Y decreases).
-    -- We adjust the comparison accordingly.
-    local function isNoteReady(yScale)
-        if CONFIG.Downscroll then
-            return yScale > threshold
-        else
-            return yScale < (1 - threshold)
-        end
-    end
 
     for col, notes in pairs(State.columns) do
         local key = State.keymap[col]
@@ -129,27 +144,25 @@ local function autoplayStep()
             for _, note in ipairs(notes:GetChildren()) do
                 if note:IsA("GuiObject") then
                     local y = note.Position.Y.Scale
-                    if isNoteReady(y) then
-                        -- Press down if not already
+                    -- Downscroll: Y increases as note falls toward judgment line
+                    if y > threshold then
                         if not State.keyState[col] then
-                            VirtualInputManager:SendKeyEvent(true, key, false, game)
+                            sendKey(true, key)
                             State.keyState[col] = true
                         end
 
-                        -- Hold note check (uses child count as heuristic)
                         if CONFIG.HoldLongNotes and #note:GetChildren() >= 2 then
                             task.spawn(function()
-                                while note.Parent and isNoteReady(note.Position.Y.Scale) and State.enabled do
+                                while note.Parent and note.Position.Y.Scale > threshold and State.enabled do
                                     RunService.Heartbeat:Wait()
                                 end
                                 if State.keyState[col] then
-                                    VirtualInputManager:SendKeyEvent(false, key, false, game)
+                                    sendKey(false, key)
                                     State.keyState[col] = false
                                 end
                             end)
                         else
-                            -- Tap note: release immediately
-                            VirtualInputManager:SendKeyEvent(false, key, false, game)
+                            sendKey(false, key)
                             State.keyState[col] = false
                         end
                     end
@@ -164,13 +177,13 @@ end
 -- ============================================================
 local function startAutoPlay()
     if State.enabled then return end
-    if not hasVIM then warn("[FF] VirtualInputManager unavailable."); return end
+    if not hasVIM then warn("[FF] VIM unavailable."); return end
     if not State.side then
         warn("[FF] Side not set. Choose Left or Right in the UI first.")
         return
     end
-    if not cacheColumns() then warn("[FF] Could not find note lanes for side:", State.side); return end
-    if not cacheKeybinds() then warn("[FF] Could not read keybinds for side:", State.side); return end
+    if not cacheColumns() then warn("[FF] Lanes not found for side:", State.side); return end
+    if not cacheKeybinds() then warn("[FF] Keybinds not read for side:", State.side); return end
 
     State.enabled = true
     State.keyState = {}
@@ -185,7 +198,7 @@ local function stopAutoPlay()
     end
     for col, pressed in pairs(State.keyState) do
         if pressed and State.keymap[col] then
-            pcall(function() VirtualInputManager:SendKeyEvent(false, State.keymap[col], false, game) end)
+            sendKey(false, State.keymap[col])
         end
     end
     State.keyState = {}
@@ -395,25 +408,65 @@ local function makeToggle(parent, nameText, descText, y, initial, cb)
 end
 
 -- Cards
-local SettingsCard = makeCard("✦ SETTINGS", 44 + ROW * 2 + 12)
+local SettingsCard = makeCard("✦ SETTINGS", 44 + ROW + 12)
+makeToggle(SettingsCard, "Hold Long Notes", "Keeps keys held down for hold notes.", 44, CONFIG.HoldLongNotes, function(v)
+    CONFIG.HoldLongNotes = v
+end)
 
-makeToggle(SettingsCard, "Auto Play", "Automatically hit notes while in a song.", 44, CONFIG.AutoPlay, function(v)
+-- Side Selection (MANDATORY)
+local SideCard = makeCard("✦ SIDE (SELECT FIRST)", 44 + 44)
+
+local sideLabel = Instance.new("TextLabel")
+sideLabel.Size = UDim2.new(1, -20, 0, 30)
+sideLabel.Position = UDim2.new(0, 10, 0, 44)
+sideLabel.BackgroundTransparency = 1
+sideLabel.Text = "Side: NOT SET"
+sideLabel.TextColor3 = Theme.Accent
+sideLabel.Font = Enum.Font.GothamBold
+sideLabel.TextSize = 14
+sideLabel.TextXAlignment = Enum.TextXAlignment.Left
+sideLabel.Parent = SideCard
+
+local function setSide(s)
+    State.side = s
+    CONFIG.Side = s
+    sideLabel.Text = "Side: " .. s
+    sideLabel.TextColor3 = Theme.Text
+    stopAutoPlay()
+end
+
+local leftBtn = Instance.new("TextButton")
+leftBtn.Size = UDim2.new(0, 70, 0, 30)
+leftBtn.Position = UDim2.new(1, -160, 0, 44)
+leftBtn.BackgroundColor3 = Theme.Card
+leftBtn.Text = "Left"
+leftBtn.TextColor3 = Theme.Text
+leftBtn.Font = Enum.Font.GothamBold
+leftBtn.TextSize = 13
+leftBtn.Parent = SideCard
+Instance.new("UICorner", leftBtn).CornerRadius = UDim.new(0, 6)
+leftBtn.MouseButton1Click:Connect(function() setSide("Left") end)
+
+local rightBtn = Instance.new("TextButton")
+rightBtn.Size = UDim2.new(0, 70, 0, 30)
+rightBtn.Position = UDim2.new(1, -80, 0, 44)
+rightBtn.BackgroundColor3 = Theme.Card
+rightBtn.Text = "Right"
+rightBtn.TextColor3 = Theme.Text
+rightBtn.Font = Enum.Font.GothamBold
+rightBtn.TextSize = 13
+rightBtn.Parent = SideCard
+Instance.new("UICorner", rightBtn).CornerRadius = UDim.new(0, 6)
+rightBtn.MouseButton1Click:Connect(function() setSide("Right") end)
+
+-- Auto Play toggle
+local PlayCard = makeCard("✦ AUTO PLAY", 44 + ROW + 12)
+makeToggle(PlayCard, "Auto Play", "Must select side first. Uses elevated thread.", 44, CONFIG.AutoPlay, function(v)
     CONFIG.AutoPlay = v
     if v then startAutoPlay() else stopAutoPlay() end
 end)
 
-makeToggle(SettingsCard, "Hold Long Notes", "Keeps keys held down for hold notes.", 44 + ROW + 6, CONFIG.HoldLongNotes, function(v)
-    CONFIG.HoldLongNotes = v
-end)
-
--- Scroll Direction Card
-local ScrollCard = makeCard("✦ SCROLL DIRECTION", 44 + ROW)
-
-makeToggle(ScrollCard, "Downscroll", "Turn OFF if your notes scroll upwards.", 44, CONFIG.Downscroll, function(v)
-    CONFIG.Downscroll = v
-end)
-
--- Precision Card
+-- Precision
 local PrecisionCard = makeCard("✦ PRECISION", 44 + 70)
 
 local precisionLabel = Instance.new("TextLabel")
@@ -448,51 +501,6 @@ precisionBox.FocusLost:Connect(function()
         precisionBox.Text = tostring(CONFIG.Accuracy)
     end
 end)
-
--- Side Selection Card (MANDATORY)
-local SideCard = makeCard("✦ SIDE (SELECT FIRST)", 44 + 44)
-
-local sideLabel = Instance.new("TextLabel")
-sideLabel.Size = UDim2.new(1, -20, 0, 30)
-sideLabel.Position = UDim2.new(0, 10, 0, 44)
-sideLabel.BackgroundTransparency = 1
-sideLabel.Text = "Side: NOT SET"
-sideLabel.TextColor3 = Theme.Accent
-sideLabel.Font = Enum.Font.GothamBold
-sideLabel.TextSize = 14
-sideLabel.TextXAlignment = Enum.TextXAlignment.Left
-sideLabel.Parent = SideCard
-
-local function setSide(s)
-    State.side = s
-    CONFIG.Side = s
-    sideLabel.Text = "Side: " .. s
-    sideLabel.TextColor3 = Theme.Text
-end
-
-local leftBtn = Instance.new("TextButton")
-leftBtn.Size = UDim2.new(0, 70, 0, 30)
-leftBtn.Position = UDim2.new(1, -160, 0, 44)
-leftBtn.BackgroundColor3 = Theme.Card
-leftBtn.Text = "Left"
-leftBtn.TextColor3 = Theme.Text
-leftBtn.Font = Enum.Font.GothamBold
-leftBtn.TextSize = 13
-leftBtn.Parent = SideCard
-Instance.new("UICorner", leftBtn).CornerRadius = UDim.new(0, 6)
-leftBtn.MouseButton1Click:Connect(function() setSide("Left") end)
-
-local rightBtn = Instance.new("TextButton")
-rightBtn.Size = UDim2.new(0, 70, 0, 30)
-rightBtn.Position = UDim2.new(1, -80, 0, 44)
-rightBtn.BackgroundColor3 = Theme.Card
-rightBtn.Text = "Right"
-rightBtn.TextColor3 = Theme.Text
-rightBtn.Font = Enum.Font.GothamBold
-rightBtn.TextSize = 13
-rightBtn.Parent = SideCard
-Instance.new("UICorner", rightBtn).CornerRadius = UDim.new(0, 6)
-rightBtn.MouseButton1Click:Connect(function() setSide("Right") end)
 
 -- Mobile float button
 if isMobile then
@@ -566,4 +574,4 @@ end))
 -- ============================================================
 -- STARTUP
 -- ============================================================
-print("[FF] Auto Player loaded. VirtualInputManager:", hasVIM, "Mobile:", isMobile)
+print("[FF] Auto Player loaded. ThreadIdentity:", hasThreadIdentity, "VIM:", hasVIM, "Mobile:", isMobile)
