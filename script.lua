@@ -1,13 +1,14 @@
--- LUAU-OL :: Funky Friday Auto Player (Thread-Elevated)
--- Uses set_thread_identity to unlock VirtualInputManager. Forced downscroll.
+-- LUAU-OL :: Funky Friday Auto Player (Smart Lane Finder & Mobile Touch Support)
+-- Dynamic note container detection, absolute path bypass, VirtualUser touch fallback.
 -- [F1] UI, [F2] unload. MIT.
 
 local CONFIG = {
     Enabled = true,
     AutoPlay = false,
-    Side = nil,                -- MUST be "Left" or "Right"
-    Accuracy = 0.4,
+    Side = nil,
+    Accuracy = 0.35,
     HoldLongNotes = true,
+    UseTouchMode = true,        -- Recommended for mobile; can also work on PC
     KeyToggle = Enum.KeyCode.F3,
 }
 
@@ -15,12 +16,12 @@ local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
 local UserInputService = game:GetService("UserInputService")
 local VirtualInputManager = game:GetService("VirtualInputManager")
+local VirtualUser = game:GetService("VirtualUser")
 
 local player = Players.LocalPlayer
 local playerGui = player:WaitForChild("PlayerGui")
 local isMobile = UserInputService.TouchEnabled and not UserInputService.MouseEnabled
 
--- Probe for thread identity elevation
 local setThreadIdentity = setthreadidentity or set_thread_identity or syn and syn.set_thread_identity
 local hasThreadIdentity = pcall(function() return type(setThreadIdentity) == "function" end)
 
@@ -29,6 +30,7 @@ local State = {
     side = CONFIG.Side,
     columns = {},
     keymap = {},
+    buttons = {},
     keyState = {},
     connection = nil,
     unloaded = false,
@@ -37,132 +39,151 @@ local State = {
 local Connections = {}
 local function addConnection(c) table.insert(Connections, c); return c end
 
--- Probe VIM
 local hasVIM = pcall(function() return VirtualInputManager.SendKeyEvent ~= nil end)
-if not hasVIM then
-    warn("[FF] VirtualInputManager unavailable. Script cannot send keys.")
-end
+local hasVU = pcall(function() return VirtualUser.Button1Down ~= nil end)
 
--- ============================================================
--- THREAD-ELEVATED KEY PRESS
--- ============================================================
-local function sendKey(isDown, keyCode)
-    if not hasVIM then return false end
-    local ok = pcall(function()
-        if hasThreadIdentity then
-            setThreadIdentity(7)  -- Elevate to register input
-        end
-        VirtualInputManager:SendKeyEvent(isDown, keyCode, false, game)
-        if hasThreadIdentity then
-            setThreadIdentity(2)  -- Restore
-        end
+-- Elevate thread identity so inputs register properly
+local function runElevated(func)
+    local ok, err = pcall(function()
+        if hasThreadIdentity then setThreadIdentity(7) end
+        func()
+        if hasThreadIdentity then setThreadIdentity(2) end
     end)
-    if not ok then
-        -- Fallback: try without elevation
-        pcall(function()
-            VirtualInputManager:SendKeyEvent(isDown, keyCode, false, game)
-        end)
-    end
     return ok
 end
 
--- ============================================================
--- CACHE LOGIC (SIDE REQUIRED)
--- ============================================================
-local function cacheColumns()
-    if not State.side then return false end
+-- Smart container finder: standard path first, then recursive search
+local function getLaneContainers()
+    local inner
     local window = playerGui:FindFirstChild("Window")
-    if not window then return false end
-    local gameGui = window:FindFirstChild("Game")
-    if not gameGui then return false end
-    local fields = gameGui:FindFirstChild("Fields")
-    if not fields then return false end
-    local field = fields:FindFirstChild(State.side)
-    if not field then return false end
-    local inner = field:FindFirstChild("Inner")
+    if window then
+        local gameGui = window:FindFirstChild("Game")
+        if gameGui then
+            local fields = gameGui:FindFirstChild("Fields")
+            if fields and State.side then
+                local field = fields:FindFirstChild(State.side)
+                if field then inner = field:FindFirstChild("Inner") end
+            end
+        end
+    end
+
+    -- Fallback: traverse Window to find an "Inner" that contains 9 lanes
+    if not inner then
+        local function findInner(obj)
+            if obj.Name == "Inner" then return obj end
+            for _, child in ipairs(obj:GetChildren()) do
+                local res = findInner(child)
+                if res then return res end
+            end
+            return nil
+        end
+        if window then inner = findInner(window) end
+    end
+
+    return inner
+end
+
+local function cacheGameData()
+    if not State.side then return false end
+    local inner = getLaneContainers()
     if not inner then return false end
 
     State.columns = {}
+    State.buttons = {}
+    State.keymap = {}
+
     for i = 1, 9 do
-        local lane = inner:FindFirstChild("Lane" .. i)
+        -- Flexible matching: Lane1, Lane 1, etc.
+        local lane
+        for _, child in ipairs(inner:GetChildren()) do
+            if child.Name:match("Lane%s*" .. i) or child.Name:find("Lane" .. i) then
+                lane = child
+                break
+            end
+        end
+
         if lane then
             local notes = lane:FindFirstChild("Notes")
             if notes then State.columns[i] = notes end
-        end
-    end
-    return next(State.columns) ~= nil
-end
 
-local function cacheKeybinds()
-    if not State.side then return false end
-    local window = playerGui:FindFirstChild("Window")
-    if not window then return false end
-    local gameGui = window:FindFirstChild("Game")
-    if not gameGui then return false end
-    local fields = gameGui:FindFirstChild("Fields")
-    if not fields then return false end
-    local field = fields:FindFirstChild(State.side)
-    if not field then return false end
-    local inner = field:FindFirstChild("Inner")
-    if not inner then return false end
-
-    State.keymap = {}
-    for i = 1, 9 do
-        local lane = inner:FindFirstChild("Lane" .. i)
-        if lane then
             local labels = lane:FindFirstChild("Labels")
             if labels then
                 local label = labels:FindFirstChild("Label")
                 if label and label:IsA("TextLabel") then
+                    -- Text may be nested in some versions
                     local keyText = label.Text
-                    if not keyText or keyText == "" then
-                        local textChild = label:FindFirstChildWhichIsA("TextLabel")
-                        if textChild then keyText = textChild.Text end
+                    if (not keyText or keyText == "") and label:FindFirstChildWhichIsA("TextLabel") then
+                        keyText = label:FindFirstChildWhichIsA("TextLabel").Text
                     end
-                    if keyText then
-                        local ok, keyCode = pcall(function() return Enum.KeyCode[keyText:upper()] end)
+                    
+                    if keyText and keyText ~= "" then
+                        local cleanKey = keyText:gsub("%s+", ""):upper()
+                        local ok, keyCode = pcall(function() return Enum.KeyCode[cleanKey] end)
                         if ok and keyCode then State.keymap[i] = keyCode end
                     end
                 end
+
+                -- Cache the button for touch mode
+                local button = lane:FindFirstChild("Button") or labels:FindFirstChild("Button") or lane:FindFirstChildWhichIsA("GuiButton")
+                if button then State.buttons[i] = button end
             end
         end
     end
-    return next(State.keymap) ~= nil
+
+    return next(State.columns) ~= nil
 end
 
--- ============================================================
--- AUTOPLAY (FORCED DOWNSCROLL)
--- ============================================================
-local function autoplayStep()
-    if not State.enabled or not hasVIM then return end
+-- Send input (auto-switches between touch and keyboard)
+local function fireInput(col, isDown)
+    if CONFIG.UseTouchMode and hasVU then
+        local btn = State.buttons[col]
+        if btn then
+            runElevated(function()
+                if isDown then
+                    VirtualUser:Button1Down(Vector2.new(btn.AbsolutePosition.X + 5, btn.AbsolutePosition.Y + 5))
+                else
+                    VirtualUser:Button1Up(Vector2.new(btn.AbsolutePosition.X + 5, btn.AbsolutePosition.Y + 5))
+                end
+            end)
+            return
+        end
+    end
 
+    if hasVIM and State.keymap[col] then
+        runElevated(function()
+            VirtualInputManager:SendKeyEvent(isDown, State.keymap[col], false, game)
+        end)
+    end
+end
+
+local function autoplayStep()
+    if not State.enabled then return end
     local threshold = CONFIG.Accuracy
 
     for col, notes in pairs(State.columns) do
-        local key = State.keymap[col]
-        if key then
+        if col and notes then
             for _, note in ipairs(notes:GetChildren()) do
-                if note:IsA("GuiObject") then
+                if note:IsA("GuiObject") and note.Visible then
                     local y = note.Position.Y.Scale
-                    -- Downscroll: Y increases as note falls toward judgment line
                     if y > threshold then
                         if not State.keyState[col] then
-                            sendKey(true, key)
+                            fireInput(col, true)
                             State.keyState[col] = true
                         end
 
+                        -- Hold note check
                         if CONFIG.HoldLongNotes and #note:GetChildren() >= 2 then
                             task.spawn(function()
                                 while note.Parent and note.Position.Y.Scale > threshold and State.enabled do
                                     RunService.Heartbeat:Wait()
                                 end
                                 if State.keyState[col] then
-                                    sendKey(false, key)
+                                    fireInput(col, false)
                                     State.keyState[col] = false
                                 end
                             end)
                         else
-                            sendKey(false, key)
+                            fireInput(col, false)
                             State.keyState[col] = false
                         end
                     end
@@ -172,22 +193,19 @@ local function autoplayStep()
     end
 end
 
--- ============================================================
--- START / STOP
--- ============================================================
 local function startAutoPlay()
     if State.enabled then return end
-    if not hasVIM then warn("[FF] VIM unavailable."); return end
-    if not State.side then
-        warn("[FF] Side not set. Choose Left or Right in the UI first.")
+    if not State.side then warn("[FF] Please select Left or Right in the UI first!"); return end
+
+    if not cacheGameData() then
+        warn("[FF] Could not find note containers. Make sure you are actively in a song.")
         return
     end
-    if not cacheColumns() then warn("[FF] Lanes not found for side:", State.side); return end
-    if not cacheKeybinds() then warn("[FF] Keybinds not read for side:", State.side); return end
 
     State.enabled = true
     State.keyState = {}
     State.connection = RunService.Heartbeat:Connect(autoplayStep)
+    print("[FF] Auto Play started. Mode:", CONFIG.UseTouchMode and "Touch" or "Keyboard")
 end
 
 local function stopAutoPlay()
@@ -197,24 +215,20 @@ local function stopAutoPlay()
         State.connection = nil
     end
     for col, pressed in pairs(State.keyState) do
-        if pressed and State.keymap[col] then
-            sendKey(false, State.keymap[col])
-        end
+        if pressed then fireInput(col, false) end
     end
     State.keyState = {}
 end
 
--- ============================================================
 -- UI
--- ============================================================
 local Theme = {
-    Bg      = Color3.fromRGB(18, 18, 24),
-    Card    = Color3.fromRGB(28, 28, 38),
-    Accent  = Color3.fromRGB(255, 120, 200),
-    Text    = Color3.fromRGB(255, 255, 255),
-    Sub     = Color3.fromRGB(160, 160, 180),
-    Off     = Color3.fromRGB(48, 48, 60),
-    Line    = Color3.fromRGB(40, 40, 52),
+    Bg = Color3.fromRGB(18, 18, 24),
+    Card = Color3.fromRGB(28, 28, 38),
+    Accent = Color3.fromRGB(255, 120, 200),
+    Text = Color3.fromRGB(255, 255, 255),
+    Sub = Color3.fromRGB(160, 160, 180),
+    Off = Color3.fromRGB(48, 48, 60),
+    Line = Color3.fromRGB(40, 40, 52),
 }
 
 local vp = workspace.CurrentCamera and workspace.CurrentCamera.ViewportSize or Vector2.new(800, 600)
@@ -265,10 +279,7 @@ local function makeDraggable(gui, handle)
     addConnection(UserInputService.InputChanged:Connect(function(input)
         if input == dragInput and dragging then
             local delta = input.Position - dragStart
-            gui.Position = UDim2.new(
-                startPos.X.Scale, startPos.X.Offset + delta.X,
-                startPos.Y.Scale, startPos.Y.Offset + delta.Y
-            )
+            gui.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + delta.X, startPos.Y.Scale, startPos.Y.Offset + delta.Y)
         end
     end))
 end
@@ -299,7 +310,6 @@ CloseBtn.Font = Enum.Font.GothamBold
 CloseBtn.TextSize = 18
 CloseBtn.Parent = TopBar
 Instance.new("UICorner", CloseBtn).CornerRadius = UDim.new(0, 8)
-
 makeDraggable(MainFrame, TopBar)
 
 local Scroll = Instance.new("ScrollingFrame")
@@ -313,7 +323,6 @@ Scroll.AutomaticCanvasSize = Enum.AutomaticSize.Y
 Scroll.Parent = MainFrame
 local List = Instance.new("UIListLayout")
 List.Padding = UDim.new(0, 10)
-List.SortOrder = Enum.SortOrder.LayoutOrder
 List.Parent = Scroll
 
 local function makeCard(titleText, height)
@@ -323,76 +332,44 @@ local function makeCard(titleText, height)
     c.BorderSizePixel = 0
     c.Parent = Scroll
     Instance.new("UICorner", c).CornerRadius = UDim.new(0, 8)
-    local s = Instance.new("UIStroke")
-    s.Color = Theme.Line
-    s.Parent = c
+    local s = Instance.new("UIStroke"); s.Color = Theme.Line; s.Parent = c
     local t = Instance.new("TextLabel")
-    t.Size = UDim2.new(1, -20, 0, 30)
-    t.Position = UDim2.new(0, 14, 0, 8)
-    t.BackgroundTransparency = 1
-    t.Text = titleText
-    t.TextColor3 = Theme.Accent
-    t.Font = Enum.Font.GothamBold
-    t.TextSize = 14
-    t.TextXAlignment = Enum.TextXAlignment.Left
-    t.Parent = c
+    t.Size = UDim2.new(1, -20, 0, 30); t.Position = UDim2.new(0, 14, 0, 8)
+    t.BackgroundTransparency = 1; t.Text = titleText; t.TextColor3 = Theme.Accent
+    t.Font = Enum.Font.GothamBold; t.TextSize = 14; t.TextXAlignment = Enum.TextXAlignment.Left; t.Parent = c
     local l = Instance.new("Frame")
-    l.Size = UDim2.new(1, -28, 0, 1)
-    l.Position = UDim2.new(0, 14, 0, 36)
-    l.BackgroundColor3 = Theme.Line
-    l.BorderSizePixel = 0
-    l.Parent = c
+    l.Size = UDim2.new(1, -28, 0, 1); l.Position = UDim2.new(0, 14, 0, 36)
+    l.BackgroundColor3 = Theme.Line; l.BorderSizePixel = 0; l.Parent = c
     return c
 end
 
 local function makeToggle(parent, nameText, descText, y, initial, cb)
     local row = Instance.new("TextButton")
-    row.Size = UDim2.new(1, -20, 0, ROW)
-    row.Position = UDim2.new(0, 10, 0, y)
-    row.BackgroundTransparency = 1
-    row.Text = ""
-    row.AutoButtonColor = false
-    row.Parent = parent
+    row.Size = UDim2.new(1, -20, 0, ROW); row.Position = UDim2.new(0, 10, 0, y)
+    row.BackgroundTransparency = 1; row.Text = ""; row.AutoButtonColor = false; row.Parent = parent
 
     local n = Instance.new("TextLabel")
-    n.Size = UDim2.new(1, -70, 0, 20)
-    n.Position = UDim2.new(0, 8, 0, isMobile and 8 or 6)
-    n.BackgroundTransparency = 1
-    n.Text = nameText
-    n.TextColor3 = Theme.Text
-    n.Font = Enum.Font.Gotham
-    n.TextSize = isMobile and 15 or 14
-    n.TextXAlignment = Enum.TextXAlignment.Left
-    n.Parent = row
+    n.Size = UDim2.new(1, -70, 0, 20); n.Position = UDim2.new(0, 8, 0, isMobile and 8 or 6)
+    n.BackgroundTransparency = 1; n.Text = nameText; n.TextColor3 = Theme.Text
+    n.Font = Enum.Font.Gotham; n.TextSize = isMobile and 15 or 14; n.TextXAlignment = Enum.TextXAlignment.Left; n.Parent = row
 
     local d = Instance.new("TextLabel")
-    d.Size = UDim2.new(1, -70, 0, 16)
-    d.Position = UDim2.new(0, 8, 0, isMobile and 28 or 24)
-    d.BackgroundTransparency = 1
-    d.Text = descText
-    d.TextColor3 = Theme.Sub
-    d.Font = Enum.Font.Gotham
-    d.TextSize = isMobile and 12 or 11
-    d.TextXAlignment = Enum.TextXAlignment.Left
-    d.Parent = row
+    d.Size = UDim2.new(1, -70, 0, 16); d.Position = UDim2.new(0, 8, 0, isMobile and 28 or 24)
+    d.BackgroundTransparency = 1; d.Text = descText; d.TextColor3 = Theme.Sub
+    d.Font = Enum.Font.Gotham; d.TextSize = isMobile and 12 or 11; d.TextXAlignment = Enum.TextXAlignment.Left; d.Parent = row
 
     local state = initial and true or false
-    local sw = isMobile and 46 or 36
-    local sh = isMobile and 22 or 18
-    local dot = isMobile and 18 or 14
+    local sw = isMobile and 46 or 36; local sh = isMobile and 22 or 18; local dot = isMobile and 18 or 14
 
     local bg = Instance.new("Frame")
-    bg.Size = UDim2.new(0, sw, 0, sh)
-    bg.Position = UDim2.new(1, -(sw + 8), 0.5, -sh/2)
-    bg.BackgroundColor3 = state and Theme.Accent or Theme.Off
-    bg.Parent = row
+    bg.Size = UDim2.new(0, sw, 0, sh); bg.Position = UDim2.new(1, -(sw + 8), 0.5, -sh/2)
+    bg.BackgroundColor3 = state and Theme.Accent or Theme.Off; bg.Parent = row
     Instance.new("UICorner", bg).CornerRadius = UDim.new(1, 0)
 
     local dotF = Instance.new("Frame")
     dotF.Size = UDim2.new(0, dot, 0, dot)
     dotF.Position = state and UDim2.new(1, -(dot + 2), 0.5, -dot/2) or UDim2.new(0, 2, 0.5, -dot/2)
-    dotF.BackgroundColor3 = Theme.Bg
-    dotF.Parent = bg
+    dotF.BackgroundColor3 = Theme.Bg; dotF.Parent = bg
     Instance.new("UICorner", dotF).CornerRadius = UDim.new(1, 0)
 
     local function render()
@@ -401,94 +378,60 @@ local function makeToggle(parent, nameText, descText, y, initial, cb)
     end
 
     row.MouseButton1Click:Connect(function()
-        state = not state
-        render()
+        state = not state; render()
         if cb then pcall(cb, state) end
     end)
 end
 
--- Cards
-local SettingsCard = makeCard("✦ SETTINGS", 44 + ROW + 12)
-makeToggle(SettingsCard, "Hold Long Notes", "Keeps keys held down for hold notes.", 44, CONFIG.HoldLongNotes, function(v)
-    CONFIG.HoldLongNotes = v
-end)
-
--- Side Selection (MANDATORY)
-local SideCard = makeCard("✦ SIDE (SELECT FIRST)", 44 + 44)
-
+local SideCard = makeCard("✦ SELECT SIDE (DO THIS FIRST)", 44 + 44)
 local sideLabel = Instance.new("TextLabel")
-sideLabel.Size = UDim2.new(1, -20, 0, 30)
-sideLabel.Position = UDim2.new(0, 10, 0, 44)
-sideLabel.BackgroundTransparency = 1
-sideLabel.Text = "Side: NOT SET"
-sideLabel.TextColor3 = Theme.Accent
-sideLabel.Font = Enum.Font.GothamBold
-sideLabel.TextSize = 14
-sideLabel.TextXAlignment = Enum.TextXAlignment.Left
-sideLabel.Parent = SideCard
+sideLabel.Size = UDim2.new(1, -20, 0, 30); sideLabel.Position = UDim2.new(0, 10, 0, 44)
+sideLabel.BackgroundTransparency = 1; sideLabel.Text = "Side: NOT SET"
+sideLabel.TextColor3 = Theme.Accent; sideLabel.Font = Enum.Font.GothamBold
+sideLabel.TextSize = 14; sideLabel.TextXAlignment = Enum.TextXAlignment.Left; sideLabel.Parent = SideCard
 
 local function setSide(s)
-    State.side = s
-    CONFIG.Side = s
-    sideLabel.Text = "Side: " .. s
-    sideLabel.TextColor3 = Theme.Text
+    State.side = s; CONFIG.Side = s
+    sideLabel.Text = "Side: " .. s; sideLabel.TextColor3 = Theme.Text
     stopAutoPlay()
 end
 
 local leftBtn = Instance.new("TextButton")
-leftBtn.Size = UDim2.new(0, 70, 0, 30)
-leftBtn.Position = UDim2.new(1, -160, 0, 44)
-leftBtn.BackgroundColor3 = Theme.Card
-leftBtn.Text = "Left"
-leftBtn.TextColor3 = Theme.Text
-leftBtn.Font = Enum.Font.GothamBold
-leftBtn.TextSize = 13
-leftBtn.Parent = SideCard
+leftBtn.Size = UDim2.new(0, 70, 0, 30); leftBtn.Position = UDim2.new(1, -160, 0, 44)
+leftBtn.BackgroundColor3 = Theme.Card; leftBtn.Text = "Left"; leftBtn.TextColor3 = Theme.Text
+leftBtn.Font = Enum.Font.GothamBold; leftBtn.TextSize = 13; leftBtn.Parent = SideCard
 Instance.new("UICorner", leftBtn).CornerRadius = UDim.new(0, 6)
 leftBtn.MouseButton1Click:Connect(function() setSide("Left") end)
 
 local rightBtn = Instance.new("TextButton")
-rightBtn.Size = UDim2.new(0, 70, 0, 30)
-rightBtn.Position = UDim2.new(1, -80, 0, 44)
-rightBtn.BackgroundColor3 = Theme.Card
-rightBtn.Text = "Right"
-rightBtn.TextColor3 = Theme.Text
-rightBtn.Font = Enum.Font.GothamBold
-rightBtn.TextSize = 13
-rightBtn.Parent = SideCard
+rightBtn.Size = UDim2.new(0, 70, 0, 30); rightBtn.Position = UDim2.new(1, -80, 0, 44)
+rightBtn.BackgroundColor3 = Theme.Card; rightBtn.Text = "Right"; rightBtn.TextColor3 = Theme.Text
+rightBtn.Font = Enum.Font.GothamBold; rightBtn.TextSize = 13; rightBtn.Parent = SideCard
 Instance.new("UICorner", rightBtn).CornerRadius = UDim.new(0, 6)
 rightBtn.MouseButton1Click:Connect(function() setSide("Right") end)
 
--- Auto Play toggle
-local PlayCard = makeCard("✦ AUTO PLAY", 44 + ROW + 12)
-makeToggle(PlayCard, "Auto Play", "Must select side first. Uses elevated thread.", 44, CONFIG.AutoPlay, function(v)
+local PlayCard = makeCard("✦ AUTO PLAY", 44 + ROW * 2 + 12)
+makeToggle(PlayCard, "Auto Play", "Must select side and use Downscroll", 44, CONFIG.AutoPlay, function(v)
     CONFIG.AutoPlay = v
     if v then startAutoPlay() else stopAutoPlay() end
 end)
 
--- Precision
-local PrecisionCard = makeCard("✦ PRECISION", 44 + 70)
+makeToggle(PlayCard, "Touch Mode", "Recommended for mobile - simulates screen taps", 44 + ROW + 6, CONFIG.UseTouchMode, function(v)
+    CONFIG.UseTouchMode = v
+end)
 
+local PrecisionCard = makeCard("✦ JUDGMENT LINE", 44 + 70)
 local precisionLabel = Instance.new("TextLabel")
-precisionLabel.Size = UDim2.new(1, -20, 0, 22)
-precisionLabel.Position = UDim2.new(0, 10, 0, 44)
-precisionLabel.BackgroundTransparency = 1
-precisionLabel.Text = "Accuracy: 0.40 (lower = earlier)"
-precisionLabel.TextColor3 = Theme.Text
-precisionLabel.Font = Enum.Font.Gotham
-precisionLabel.TextSize = 13
-precisionLabel.TextXAlignment = Enum.TextXAlignment.Left
-precisionLabel.Parent = PrecisionCard
+precisionLabel.Size = UDim2.new(1, -20, 0, 22); precisionLabel.Position = UDim2.new(0, 10, 0, 44)
+precisionLabel.BackgroundTransparency = 1; precisionLabel.Text = "Value: 0.35 (higher = later)"
+precisionLabel.TextColor3 = Theme.Text; precisionLabel.Font = Enum.Font.Gotham
+precisionLabel.TextSize = 13; precisionLabel.TextXAlignment = Enum.TextXAlignment.Left; precisionLabel.Parent = PrecisionCard
 
 local precisionBox = Instance.new("TextBox")
-precisionBox.Size = UDim2.new(0, 80, 0, 30)
-precisionBox.Position = UDim2.new(1, -90, 0, 44)
-precisionBox.BackgroundColor3 = Theme.Card
-precisionBox.Text = tostring(CONFIG.Accuracy)
-precisionBox.TextColor3 = Theme.Text
-precisionBox.Font = Enum.Font.Gotham
-precisionBox.TextSize = 13
-precisionBox.Parent = PrecisionCard
+precisionBox.Size = UDim2.new(0, 80, 0, 30); precisionBox.Position = UDim2.new(1, -90, 0, 44)
+precisionBox.BackgroundColor3 = Theme.Card; precisionBox.Text = tostring(CONFIG.Accuracy)
+precisionBox.TextColor3 = Theme.Text; precisionBox.Font = Enum.Font.Gotham
+precisionBox.TextSize = 13; precisionBox.Parent = PrecisionCard
 Instance.new("UICorner", precisionBox).CornerRadius = UDim.new(0, 6)
 precisionBox.FocusLost:Connect(function()
     local num = tonumber(precisionBox.Text)
@@ -496,82 +439,27 @@ precisionBox.FocusLost:Connect(function()
         num = math.clamp(num, 0, 1)
         CONFIG.Accuracy = num
         precisionBox.Text = string.format("%.2f", num)
-        precisionLabel.Text = string.format("Accuracy: %.2f (lower = earlier)", num)
+        precisionLabel.Text = string.format("Value: %.2f (higher = later)", num)
     else
         precisionBox.Text = tostring(CONFIG.Accuracy)
     end
 end)
 
--- Mobile float button
-if isMobile then
-    local floatBtn = Instance.new("TextButton")
-    floatBtn.Size = UDim2.new(0, 56, 0, 56)
-    floatBtn.Position = UDim2.new(0, 16, 0.5, -28)
-    floatBtn.BackgroundColor3 = Theme.Accent
-    floatBtn.Text = "FF"
-    floatBtn.TextColor3 = Color3.new(0, 0, 0)
-    floatBtn.Font = Enum.Font.GothamBold
-    floatBtn.TextSize = 20
-    floatBtn.Parent = ScreenGui
-    Instance.new("UICorner", floatBtn).CornerRadius = UDim.new(1, 0)
-
-    local drag, moved, sp, sip, conn
-    floatBtn.InputBegan:Connect(function(i)
-        if i.UserInputType ~= Enum.UserInputType.Touch and i.UserInputType ~= Enum.UserInputType.MouseButton1 then return end
-        drag = true; moved = false; sp = floatBtn.Position; sip = i.Position
-        if conn then conn:Disconnect() end
-        conn = i.Changed:Connect(function()
-            if i.UserInputState == Enum.UserInputState.Change and drag then
-                local d = i.Position - sip
-                if d.Magnitude > 8 then moved = true end
-                if moved then
-                    floatBtn.Position = UDim2.new(sp.X.Scale, sp.X.Offset + d.X, sp.Y.Scale, sp.Y.Offset + d.Y)
-                end
-            elseif i.UserInputState == Enum.UserInputState.End then
-                drag = false
-                if not moved then MainFrame.Visible = not MainFrame.Visible end
-                if conn then conn:Disconnect() end
-            end
-        end)
-    end)
-end
-
--- ============================================================
--- CLEANUP
--- ============================================================
 local function unload()
     if State.unloaded then return end
     State.unloaded = true
     CONFIG.Enabled = false
-
     stopAutoPlay()
-    for _, c in ipairs(Connections) do
-        pcall(function() c:Disconnect() end)
-    end
+    for _, c in ipairs(Connections) do pcall(function() c:Disconnect() end) end
     if ScreenGui then ScreenGui:Destroy() end
-    if getgenv().FF_AutoPlayer_Unload == unload then
-        getgenv().FF_AutoPlayer_Unload = nil
-    end
     print("[FF] Auto Player unloaded.")
 end
 
-getgenv().FF_AutoPlayer_Unload = unload
-
-CloseBtn.MouseButton1Click:Connect(function()
-    MainFrame.Visible = false
-end)
-
+CloseBtn.MouseButton1Click:Connect(function() MainFrame.Visible = false end)
 addConnection(UserInputService.InputBegan:Connect(function(input, gp)
     if gp then return end
     if input.KeyCode == Enum.KeyCode.F2 then unload() end
     if input.KeyCode == Enum.KeyCode.F1 then MainFrame.Visible = not MainFrame.Visible end
-    if input.KeyCode == CONFIG.KeyToggle then
-        CONFIG.AutoPlay = not CONFIG.AutoPlay
-        if CONFIG.AutoPlay then startAutoPlay() else stopAutoPlay() end
-    end
 end))
 
--- ============================================================
--- STARTUP
--- ============================================================
-print("[FF] Auto Player loaded. ThreadIdentity:", hasThreadIdentity, "VIM:", hasVIM, "Mobile:", isMobile)
+print("[FF] Script Ready. TouchMode Available:", hasVU)
