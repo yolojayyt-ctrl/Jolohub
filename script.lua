@@ -1,5 +1,5 @@
--- LUAU-OL :: Funky Friday Auto Player (UI Fixed & Deep Search)
--- Auto-finds lanes, visible UI on load, VirtualUser touch support.
+-- LUAU-OL :: Funky Friday Auto Player (Dynamic Lane Detection & Delta Native Input)
+-- Deep container search, direct Click simulation, and built-in diagnostics.
 -- [F1] UI, [F2] unload. MIT.
 
 local CONFIG = {
@@ -8,14 +8,14 @@ local CONFIG = {
     Side = nil,
     Accuracy = 0.35,
     HoldLongNotes = true,
-    UseTouchMode = true,
+    UseDirectClick = true,      -- Delta Mobile: simulates actual button clicks instead of VirtualUser
+    DebugMode = false,          -- Prints lane paths to console if notes still don't register
 }
 
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
 local UserInputService = game:GetService("UserInputService")
 local VirtualInputManager = game:GetService("VirtualInputManager")
-local VirtualUser = game:GetService("VirtualUser")
 
 local player = Players.LocalPlayer
 local playerGui = player:WaitForChild("PlayerGui")
@@ -39,7 +39,6 @@ local Connections = {}
 local function addConnection(c) table.insert(Connections, c); return c end
 
 local hasVIM = pcall(function() return VirtualInputManager.SendKeyEvent ~= nil end)
-local hasVU = pcall(function() return VirtualUser.Button1Down ~= nil end)
 
 local function runElevated(func)
     local ok, err = pcall(function()
@@ -50,76 +49,82 @@ local function runElevated(func)
     return ok
 end
 
--- Deep search for the lane container to prevent "Lanes not found" errors
+-- Deep search that counts lanes and returns the container plus a report
 local function findLaneContainer()
-    local function checkForLanes(obj)
+    local function checkForLanes(obj, path)
         local laneCount = 0
+        local foundLanes = {}
         for _, child in ipairs(obj:GetChildren()) do
-            if child.Name:match("Lane%s*%d") or child.Name:match("Lane") then
+            if child.Name:match("Lane") or child.Name:match("Note") then
                 laneCount = laneCount + 1
+                table.insert(foundLanes, child.Name)
             end
         end
-        if laneCount >= 9 then return obj end
+        if laneCount >= 4 then -- Relaxed from 9 to 4 to catch partial UI states
+            return obj, foundLanes
+        end
         for _, child in ipairs(obj:GetChildren()) do
             if child:IsA("GuiObject") then
-                local res = checkForLanes(child)
-                if res then return res end
+                local res, lanes = checkForLanes(child, path .. "." .. child.Name)
+                if res then return res, lanes end
             end
         end
-        return nil
+        return nil, nil
     end
 
     local window = playerGui:FindFirstChild("Window")
-    if window then
-        local res = checkForLanes(window)
-        if res then return res end
-    end
-
-    -- Fallback to searching the whole PlayerGui
-    return checkForLanes(playerGui)
+    local target = window or playerGui
+    local container, lanes = checkForLanes(target, "Root")
+    return container, lanes
 end
 
 local function cacheGameData()
-    local inner = findLaneContainer()
-    if not inner then return false end
+    local inner, lanes = findLaneContainer()
+    if not inner then
+        warn("[FF] Could not find any lane containers in the GUI.")
+        return false
+    end
+
+    if CONFIG.DebugMode then
+        print("[FF Debug] Found container:", inner:GetFullName())
+        print("[FF Debug] Lanes detected:", table.concat(lanes, ", "))
+    end
 
     State.columns = {}
     State.buttons = {}
     State.keymap = {}
 
-    for i = 1, 9 do
-        local lane
-        for _, child in ipairs(inner:GetChildren()) do
-            if child.Name:match("Lane%s*" .. i) or child.Name:find("Lane" .. i) then
-                lane = child
-                break
-            end
-        end
+    -- Scan every child in the container for matching lanes
+    for _, child in ipairs(inner:GetChildren()) do
+        -- Match "Lane1", "Lane 1", "Lane1_Left", "LeftLane1", etc.
+        local laneNum = child.Name:match("(%d+)")
+        if laneNum and tonumber(laneNum) >= 1 and tonumber(laneNum) <= 9 then
+            local i = tonumber(laneNum)
+            if not State.columns[i] then
+                local notes = child:FindFirstChild("Notes") or child:FindFirstChildWhichIsA("Folder")
+                if notes then State.columns[i] = notes end
 
-        if lane then
-            local notes = lane:FindFirstChild("Notes")
-            if notes then State.columns[i] = notes end
-
-            local labels = lane:FindFirstChild("Labels")
-            if labels then
-                local label = labels:FindFirstChild("Label")
-                if label and label:IsA("TextLabel") then
-                    local keyText = label.Text
-                    if (not keyText or keyText == "") and label:FindFirstChildWhichIsA("TextLabel") then
-                        keyText = label:FindFirstChildWhichIsA("TextLabel").Text
-                    end
-                    
-                    if keyText and keyText ~= "" then
-                        local cleanKey = keyText:gsub("%s+", ""):upper()
-                        local ok, keyCode = pcall(function() return Enum.KeyCode[cleanKey] end)
-                        if ok and keyCode then State.keymap[i] = keyCode end
+                local labels = child:FindFirstChild("Labels")
+                if labels then
+                    local label = labels:FindFirstChild("Label")
+                    if label and label:IsA("TextLabel") then
+                        local keyText = label.Text
+                        if not keyText or keyText == "" then
+                            local textChild = label:FindFirstChildWhichIsA("TextLabel")
+                            if textChild then keyText = textChild.Text end
+                        end
+                        if keyText and keyText ~= "" then
+                            local cleanKey = keyText:gsub("%s+", ""):upper()
+                            local ok, keyCode = pcall(function() return Enum.KeyCode[cleanKey] end)
+                            if ok and keyCode then State.keymap[i] = keyCode end
+                        end
                     end
                 end
-            end
 
-            -- Find button for touch mode
-            local button = lane:FindFirstChild("Button") or (lane:IsA("GuiButton") and lane) or (labels and (labels:FindFirstChild("Button") or labels:FindFirstChildWhichIsA("GuiButton")))
-            if button then State.buttons[i] = button end
+                -- Cache the actual hit button (not VirtualUser)
+                local button = child:FindFirstChild("Button") or child:FindFirstChildWhichIsA("GuiButton")
+                if button then State.buttons[i] = button end
+            end
         end
     end
 
@@ -127,21 +132,17 @@ local function cacheGameData()
 end
 
 local function fireInput(col, isDown)
-    if CONFIG.UseTouchMode and hasVU then
-        local btn = State.buttons[col]
-        if btn then
-            runElevated(function()
-                local pos = Vector2.new(btn.AbsolutePosition.X + 5, btn.AbsolutePosition.Y + 5)
-                if isDown then
-                    VirtualUser:Button1Down(pos, workspace.CurrentCamera.CFrame)
-                else
-                    VirtualUser:Button1Up(pos, workspace.CurrentCamera.CFrame)
-                end
-            end)
-            return
-        end
+    -- Method 1: Direct GuiObject Click (Reliable on Delta Mobile)
+    if CONFIG.UseDirectClick and State.buttons[col] then
+        runElevated(function()
+            if isDown then
+                State.buttons[col]:Click() -- Simulates a direct mouse/tap click on the arrow UI
+            end
+        end)
+        return
     end
 
+    -- Method 2: VirtualInputManager Keyboard
     if hasVIM and State.keymap[col] then
         runElevated(function()
             VirtualInputManager:SendKeyEvent(isDown, State.keymap[col], false, game)
@@ -190,7 +191,7 @@ local function startAutoPlay()
     if not State.side then warn("[FF] Please select Left or Right in the UI first!"); return end
 
     if not cacheGameData() then
-        warn("[FF] Could not find notes. Make sure you are actively in a song.")
+        warn("[FF] Failed to find lanes. Turn on 'Debug Mode' to see what the script sees.")
         return
     end
 
@@ -240,7 +241,7 @@ MainFrame.Position = UDim2.new(0.5, -FW/2, 0.5, -FH/2)
 MainFrame.BackgroundColor3 = Theme.Bg
 MainFrame.BorderSizePixel = 0
 MainFrame.Active = true
-MainFrame.Visible = true -- FIXED: Always visible on load
+MainFrame.Visible = true
 MainFrame.Parent = ScreenGui
 Instance.new("UICorner", MainFrame).CornerRadius = UDim.new(0, 10)
 local stroke = Instance.new("UIStroke")
@@ -402,14 +403,18 @@ rightBtn.Font = Enum.Font.GothamBold; rightBtn.TextSize = 13; rightBtn.Parent = 
 Instance.new("UICorner", rightBtn).CornerRadius = UDim.new(0, 6)
 rightBtn.MouseButton1Click:Connect(function() setSide("Right") end)
 
-local PlayCard = makeCard("✦ AUTO PLAY", 44 + ROW * 2 + 12)
+local PlayCard = makeCard("✦ AUTO PLAY", 44 + ROW * 3 + 18)
 makeToggle(PlayCard, "Auto Play", "Must select side and use Downscroll", 44, CONFIG.AutoPlay, function(v)
     CONFIG.AutoPlay = v
     if v then startAutoPlay() else stopAutoPlay() end
 end)
 
-makeToggle(PlayCard, "Touch Mode", "Recommended for mobile", 44 + ROW + 6, CONFIG.UseTouchMode, function(v)
-    CONFIG.UseTouchMode = v
+makeToggle(PlayCard, "Direct Click (Mobile)", "Simulates tapping the on-screen arrows directly", 44 + ROW + 6, CONFIG.UseDirectClick, function(v)
+    CONFIG.UseDirectClick = v
+end)
+
+makeToggle(PlayCard, "Debug Mode", "Prints detected lanes to the F9 console", 44 + (ROW + 6) * 2, CONFIG.DebugMode, function(v)
+    CONFIG.DebugMode = v
 end)
 
 local PrecisionCard = makeCard("✦ JUDGMENT LINE", 44 + 70)
@@ -436,40 +441,6 @@ precisionBox.FocusLost:Connect(function()
         precisionBox.Text = tostring(CONFIG.Accuracy)
     end
 end)
-
--- Mobile Float Button (Restored)
-if isMobile then
-    local floatBtn = Instance.new("TextButton")
-    floatBtn.Size = UDim2.new(0, 56, 0, 56)
-    floatBtn.Position = UDim2.new(0, 16, 0.5, -28)
-    floatBtn.BackgroundColor3 = Theme.Accent
-    floatBtn.Text = "FF"
-    floatBtn.TextColor3 = Color3.new(0, 0, 0)
-    floatBtn.Font = Enum.Font.GothamBold
-    floatBtn.TextSize = 20
-    floatBtn.Parent = ScreenGui
-    Instance.new("UICorner", floatBtn).CornerRadius = UDim.new(1, 0)
-
-    local drag, moved, sp, sip, conn
-    floatBtn.InputBegan:Connect(function(i)
-        if i.UserInputType ~= Enum.UserInputType.Touch and i.UserInputType ~= Enum.UserInputType.MouseButton1 then return end
-        drag = true; moved = false; sp = floatBtn.Position; sip = i.Position
-        if conn then conn:Disconnect() end
-        conn = i.Changed:Connect(function()
-            if i.UserInputState == Enum.UserInputState.Change and drag then
-                local d = i.Position - sip
-                if d.Magnitude > 8 then moved = true end
-                if moved then
-                    floatBtn.Position = UDim2.new(sp.X.Scale, sp.X.Offset + d.X, sp.Y.Scale, sp.Y.Offset + d.Y)
-                end
-            elseif i.UserInputState == Enum.UserInputState.End then
-                drag = false
-                if not moved then MainFrame.Visible = not MainFrame.Visible end
-                if conn then conn:Disconnect() end
-            end
-        end)
-    end)
-end
 
 local function unload()
     if State.unloaded then return end
