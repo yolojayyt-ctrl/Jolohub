@@ -1,355 +1,286 @@
--- LUAU-OL :: AOTR Jolo Hub (v1.2)
--- Player-side combat + ODM quality-of-life for Attack on Titan Revolution.
--- Kill Aura uses Tool:Activate (game's own combat path). ESP uses BillboardGui.
--- Mobile touch UI, Delta-friendly. [F1] toggle UI, [F2] unload. MIT.
+-- LUAU-OL :: Funky Friday Auto Player
+-- Automatically hits notes in Funky Friday using VirtualInputManager.
+-- [F1] toggle UI, [F2] unload. MIT.
 
 local CONFIG = {
     Enabled = true,
-    -- Combat
-    KillAura = false,
-    KillAuraRange = 100,
-    KillAuraInterval = 0.2,
-    FaceTarget = true,
-    AutoReloadBlades = false,
-    ReloadInterval = 2.5,
-    -- ODM (perk-based — may no-op if game doesn't expose these)
-    InfiniteGas = false,
-    InfiniteBoost = false,
-    NoHookCooldown = false,
-    InstantHook = false,
-    -- Movement
-    WalkSpeed = 16,
-    JumpPower = 50,
-    ApplyMovement = false,
-    -- Visuals
-    TitanESP = false,
-    ESPColor = Color3.fromRGB(245, 194, 17),
-    -- Utility
-    AntiAFK = true,
+    AutoPlay = false,
+    Side = nil,                -- "Left" or "Right"; auto-detected on start
+    Accuracy = 0.4,            -- 0.0 = early, 1.0 = late (note Y threshold)
+    Humanization = false,      -- randomise the threshold slightly
+    HumanizeRange = 0.05,      -- max ± range in scale units
+    HoldLongNotes = true,      -- keep key held for hold notes
+    KeyToggle = Enum.KeyCode.F3,
 }
 
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
 local UserInputService = game:GetService("UserInputService")
-local VirtualUser = game:GetService("VirtualUser")
-local Workspace = game:GetService("Workspace")
+local VirtualInputManager = game:GetService("VirtualInputManager")
 
 local player = Players.LocalPlayer
 local playerGui = player:WaitForChild("PlayerGui")
-
 local isMobile = UserInputService.TouchEnabled and not UserInputService.MouseEnabled
 
+-- ============================================================
+-- STATE & TRACKING
+-- ============================================================
+local State = {
+    enabled = false,
+    side = nil,
+    columns = {},
+    keymap = {},
+    keyState = {},             -- per-column pressed flag
+    connection = nil,
+    unloaded = false,
+}
+
 local Connections = {}
-local ESP_TAGS = {}
-local Unloaded = false
 
-local function addConnection(c) table.insert(Connections, c); return c end
-
--- API probes
-local hasVirtualUser = pcall(function() return VirtualUser.Button2Down ~= nil end)
-if not hasVirtualUser then warn("[AOTR] VirtualUser unavailable - Anti-AFK may not fire.") end
-
--- ============================================================
--- HELPERS
--- ============================================================
-local function getChar() return player.Character end
-local function getHumanoid()
-    local c = getChar()
-    return c and c:FindFirstChildOfClass("Humanoid")
-end
-local function getRoot()
-    local c = getChar()
-    return c and c:FindFirstChild("HumanoidRootPart")
+local function addConnection(c)
+    table.insert(Connections, c)
+    return c
 end
 
-local function getTitans()
-    local t = {}
-    for _, obj in ipairs(Workspace:GetDescendants()) do
-        if obj:IsA("Model") then
-            local hum = obj:FindFirstChildOfClass("Humanoid")
-            if hum and hum.Health > 0 then
-                local lower = obj.Name:lower()
-                if lower:find("titan") or obj:GetAttribute("IsTitan") then
-                    table.insert(t, obj)
+-- ============================================================
+-- API PROBE
+-- ============================================================
+local hasVirtualInputManager = pcall(function()
+    return VirtualInputManager.SendKeyEvent ~= nil
+end)
+if not hasVirtualInputManager then
+    warn("[FF] VirtualInputManager unavailable — Auto Player cannot send key events.")
+end
+
+-- ============================================================
+-- SIDE DETECTION
+-- ============================================================
+local function detectSide()
+    local char = player.Character
+    local root = char and char:FindFirstChild("HumanoidRootPart")
+    if not root then return nil end
+
+    local map = workspace:FindFirstChild("Map")
+    if not map then return nil end
+    local stages = map:FindFirstChild("Stages")
+    if not stages then return nil end
+
+    for _, stage in ipairs(stages:GetChildren()) do
+        local teams = stage:FindFirstChild("Teams")
+        if teams then
+            for _, sideName in ipairs({"Left", "Right"}) do
+                local pad = teams:FindFirstChild(sideName)
+                if pad and (root.Position - pad.Position).Magnitude <= 5 then
+                    return sideName
                 end
             end
         end
     end
-    return t
-end
-
-local function getNearestTitan(range)
-    local root = getRoot()
-    if not root then return nil end
-    local nearest, best = nil, range
-    for _, titan in ipairs(getTitans()) do
-        local hrp = titan:FindFirstChild("HumanoidRootPart")
-        if hrp then
-            local d = (hrp.Position - root.Position).Magnitude
-            if d < best then nearest, best = titan, d end
-        end
-    end
-    return nearest
-end
-
-local function getBladeTool()
-    local char = getChar()
-    if not char then return nil end
-    local fallback
-    for _, obj in ipairs(char:GetChildren()) do
-        if obj:IsA("Tool") then
-            local lower = obj.Name:lower()
-            if lower:find("blade") or lower:find("sword") or lower:find("weapon") then
-                return obj
-            end
-            fallback = fallback or obj
-        end
-    end
-    return fallback
+    return nil
 end
 
 -- ============================================================
--- COMBAT — Tool:Activate is the path the game itself uses
+-- CACHE COLUMNS & KEYBINDS
 -- ============================================================
-local function faceTarget(target)
-    if not CONFIG.FaceTarget then return end
-    local root = getRoot()
-    local hrp = target:FindFirstChild("HumanoidRootPart")
-    if root and hrp then
-        local look = CFrame.lookAt(
-            root.Position,
-            Vector3.new(hrp.Position.X, root.Position.Y, hrp.Position.Z)
-        )
-        root.CFrame = look
-    end
-end
+local function cacheColumns()
+    if not State.side then return false end
+    local window = playerGui:FindFirstChild("Window")
+    if not window then return false end
+    local gameGui = window:FindFirstChild("Game")
+    if not gameGui then return false end
+    local fields = gameGui:FindFirstChild("Fields")
+    if not fields then return false end
+    local field = fields:FindFirstChild(State.side)
+    if not field then return false end
+    local inner = field:FindFirstChild("Inner")
+    if not inner then return false end
 
-local function swingBlade()
-    local tool = getBladeTool()
-    if tool then
-        pcall(function() tool:Activate() end)
-        return true
-    end
-    return false
-end
-
-local function killAuraLoop()
-    while CONFIG.Enabled and not Unloaded do
-        if CONFIG.KillAura then
-            local titan = getNearestTitan(CONFIG.KillAuraRange)
-            if titan then
-                faceTarget(titan)
-                swingBlade()
+    State.columns = {}
+    for i = 1, 9 do
+        local lane = inner:FindFirstChild("Lane" .. i)
+        if lane then
+            local notes = lane:FindFirstChild("Notes")
+            if notes then
+                State.columns[i] = notes
             end
         end
-        task.wait(CONFIG.KillAuraInterval)
     end
+    return next(State.columns) ~= nil
 end
 
-local function reloadLoop()
-    while CONFIG.Enabled and not Unloaded do
-        if CONFIG.AutoReloadBlades then
-            local char = getChar()
-            local blade = getBladeTool()
-            if char and blade then
-                pcall(function()
-                    local backpack = player:FindFirstChildOfClass("Backpack")
-                    if backpack then
-                        blade.Parent = backpack
-                        task.wait(0.05)
-                        blade.Parent = char
+local function cacheKeybinds()
+    if not State.side then return false end
+    local window = playerGui:FindFirstChild("Window")
+    if not window then return false end
+    local gameGui = window:FindFirstChild("Game")
+    if not gameGui then return false end
+    local fields = gameGui:FindFirstChild("Fields")
+    if not fields then return false end
+    local field = fields:FindFirstChild(State.side)
+    if not field then return false end
+    local inner = field:FindFirstChild("Inner")
+    if not inner then return false end
+
+    State.keymap = {}
+    for i = 1, 9 do
+        local lane = inner:FindFirstChild("Lane" .. i)
+        if lane then
+            local labels = lane:FindFirstChild("Labels")
+            if labels then
+                local label = labels:FindFirstChild("Label")
+                if label and label:IsA("TextLabel") then
+                    local keyName = label.Text
+                    local ok, keyCode = pcall(function()
+                        return Enum.KeyCode[keyName]
+                    end)
+                    if ok then
+                        State.keymap[i] = keyCode
                     end
-                end)
+                end
             end
         end
-        task.wait(CONFIG.ReloadInterval)
     end
+    return next(State.keymap) ~= nil
 end
 
 -- ============================================================
--- ODM (perk-based — honest fallback)
+-- AUTOPLAY LOGIC
 -- ============================================================
-local function applyODM()
-    local hum = getHumanoid()
-    if not hum then return end
-    -- Try attributes first; if the game stores stats elsewhere these will no-op.
-    if CONFIG.InfiniteGas then
-        pcall(function()
-            hum:SetAttribute("Gas", 1e9)
-            local char = getChar()
-            if char then char:SetAttribute("Gas", 1e9) end
-        end)
-    end
-    if CONFIG.InfiniteBoost then
-        pcall(function()
-            hum:SetAttribute("Boost", 1e9)
-        end)
-    end
-    if CONFIG.NoHookCooldown then
-        pcall(function()
-            hum:SetAttribute("HookCooldown", 0)
-        end)
-    end
-    if CONFIG.InstantHook then
-        pcall(function()
-            hum:SetAttribute("HookSpeed", 999)
-        end)
-    end
-end
+local function autoplayStep()
+    if not State.enabled or not State.side then return end
+    if not hasVirtualInputManager then return end
 
-local function odmLoop()
-    while CONFIG.Enabled and not Unloaded do
-        applyODM()
-        task.wait(0.5)
+    local threshold = CONFIG.Accuracy
+    if CONFIG.Humanization then
+        threshold = threshold + (math.random() - 0.5) * CONFIG.HumanizeRange
     end
-end
+    threshold = math.clamp(threshold, 0, 1)
 
--- ============================================================
--- MOVEMENT
--- ============================================================
-local function movementLoop()
-    while CONFIG.Enabled and not Unloaded do
-        if CONFIG.ApplyMovement then
-            local hum = getHumanoid()
-            if hum then
-                pcall(function()
-                    hum.WalkSpeed = CONFIG.WalkSpeed
-                    hum.JumpPower = CONFIG.JumpPower
-                end)
+    for col, notes in pairs(State.columns) do
+        local key = State.keymap[col]
+        if not key then continue end
+
+        for _, note in ipairs(notes:GetChildren()) do
+            if note:IsA("GuiObject") then
+                local y = note.Position.Y.Scale
+                if y > threshold then
+                    -- Press down if not already
+                    if not State.keyState[col] then
+                        VirtualInputManager:SendKeyEvent(true, key, false, game)
+                        State.keyState[col] = true
+                    end
+
+                    -- Hold note: wait until it passes, then release
+                    if CONFIG.HoldLongNotes and #note:GetChildren() >= 2 then
+                        task.spawn(function()
+                            while note.Parent and note.Position.Y.Scale > threshold and State.enabled do
+                                RunService.Heartbeat:Wait()
+                            end
+                            if State.keyState[col] then
+                                VirtualInputManager:SendKeyEvent(false, key, false, game)
+                                State.keyState[col] = false
+                            end
+                        end)
+                    else
+                        -- Tap note: release immediately
+                        VirtualInputManager:SendKeyEvent(false, key, false, game)
+                        State.keyState[col] = false
+                    end
+                end
             end
         end
-        task.wait(0.5)
     end
 end
 
 -- ============================================================
--- TITAN ESP (BillboardGui — no Drawing dependency)
+-- START / STOP
 -- ============================================================
-local function clearESP()
-    for _, tag in pairs(ESP_TAGS) do
-        if tag and tag.Parent then pcall(function() tag:Destroy() end) end
-    end
-    ESP_TAGS = {}
-end
-
-local function updateESP()
-    if not CONFIG.TitanESP then
-        clearESP()
+local function startAutoPlay()
+    if State.enabled then return end
+    if not hasVirtualInputManager then
+        warn("[FF] Cannot start — VirtualInputManager missing.")
         return
     end
 
-    local titans = getTitans()
-    local seen = {}
-
-    for _, titan in ipairs(titans) do
-        local hrp = titan:FindFirstChild("HumanoidRootPart")
-        if hrp then
-            local existing = ESP_TAGS[titan]
-            if not existing or not existing.Parent then
-                local billboard = Instance.new("BillboardGui")
-                billboard.Name = "AOTR_ESP"
-                billboard.Size = UDim2.new(0, 120, 0, 32)
-                billboard.StudsOffset = Vector3.new(0, 3, 0)
-                billboard.AlwaysOnTop = true
-                billboard.LightInfluence = 0
-                billboard.Adornee = hrp
-
-                local label = Instance.new("TextLabel")
-                label.Size = UDim2.new(1, 0, 1, 0)
-                label.BackgroundColor3 = Color3.fromRGB(0, 0, 0)
-                label.BackgroundTransparency = 0.4
-                label.TextColor3 = CONFIG.ESPColor
-                label.Text = titan.Name
-                label.Font = Enum.Font.GothamBold
-                label.TextSize = 14
-                label.Parent = billboard
-                Instance.new("UICorner", label).CornerRadius = UDim.new(0, 4)
-
-                billboard.Parent = hrp
-                ESP_TAGS[titan] = billboard
-            else
-                existing.Adornee = hrp
-            end
-            seen[titan] = true
+    -- Detect side if not set
+    if not State.side then
+        local detected = detectSide()
+        if detected then
+            State.side = detected
+        else
+            warn("[FF] Could not detect side. Stand on the Left or Right pad and try again.")
+            return
         end
     end
 
-    for titan, tag in pairs(ESP_TAGS) do
-        if not seen[titan] then
-            if tag and tag.Parent then pcall(function() tag:Destroy() end) end
-            ESP_TAGS[titan] = nil
+    -- Cache lanes and keys
+    if not cacheColumns() then
+        warn("[FF] Could not find note lanes for side:", State.side)
+        return
+    end
+    if not cacheKeybinds() then
+        warn("[FF] Could not read keybinds for side:", State.side)
+        return
+    end
+
+    State.enabled = true
+    State.keyState = {}
+    State.connection = RunService.Heartbeat:Connect(autoplayStep)
+end
+
+local function stopAutoPlay()
+    State.enabled = false
+    if State.connection then
+        pcall(function() State.connection:Disconnect() end)
+        State.connection = nil
+    end
+    -- Release any held keys
+    for col, pressed in pairs(State.keyState) do
+        if pressed and State.keymap[col] then
+            pcall(function()
+                VirtualInputManager:SendKeyEvent(false, State.keymap[col], false, game)
+            end)
         end
     end
+    State.keyState = {}
 end
-
-local function espLoop()
-    while CONFIG.Enabled and not Unloaded do
-        pcall(updateESP)
-        task.wait(0.4)
-    end
-end
-
--- ============================================================
--- ANTI-AFK
--- ============================================================
-local function setupAntiAFK()
-    addConnection(player.Idled:Connect(function()
-        if not CONFIG.AntiAFK then return end
-        pcall(function()
-            VirtualUser:Button2Down(Vector2.new(0, 0), Workspace.CurrentCamera.CFrame)
-            task.wait(1)
-            VirtualUser:Button2Up(Vector2.new(0, 0), Workspace.CurrentCamera.CFrame)
-        end)
-    end))
-end
-
--- ============================================================
--- PRIOR INSTANCE GUARD
--- ============================================================
-local oldUnload = getgenv().AOTR_JoloHub_Unload
-if type(oldUnload) == "function" then pcall(oldUnload) end
 
 -- ============================================================
 -- UI
 -- ============================================================
 local Theme = {
-    Background = Color3.fromRGB(20, 20, 20),
-    Sidebar    = Color3.fromRGB(15, 15, 15),
-    Card       = Color3.fromRGB(30, 30, 30),
-    Accent     = Color3.fromRGB(245, 194, 17),
-    Text       = Color3.fromRGB(255, 255, 255),
-    SubText    = Color3.fromRGB(150, 150, 150),
-    ToggleOff  = Color3.fromRGB(50, 50, 50),
-    Line       = Color3.fromRGB(40, 40, 40),
+    Bg      = Color3.fromRGB(18, 18, 24),
+    Card    = Color3.fromRGB(28, 28, 38),
+    Accent  = Color3.fromRGB(255, 120, 200),
+    Text    = Color3.fromRGB(255, 255, 255),
+    Sub     = Color3.fromRGB(160, 160, 180),
+    Off     = Color3.fromRGB(48, 48, 60),
+    Line    = Color3.fromRGB(40, 40, 52),
 }
 
-local viewport = Workspace.CurrentCamera and Workspace.CurrentCamera.ViewportSize or Vector2.new(800, 600)
-local FRAME_W = isMobile and math.clamp(viewport.X - 20, 300, 560) or 680
-local FRAME_H = isMobile and math.clamp(viewport.Y - 50, 360, 540) or 500
-local ROW_H = isMobile and 52 or 40
-local SHOW_SIDEBAR = not isMobile
-local SIDEBAR_W = SHOW_SIDEBAR and 160 or 0
+local vp = workspace.CurrentCamera and workspace.CurrentCamera.ViewportSize or Vector2.new(800, 600)
+local FW = isMobile and math.clamp(vp.X - 20, 300, 560) or 480
+local FH = isMobile and math.clamp(vp.Y - 50, 360, 520) or 400
+local ROW = isMobile and 52 or 42
 
 local ScreenGui = Instance.new("ScreenGui")
-ScreenGui.Name = "JoloHubUI"
+ScreenGui.Name = "FF_AutoPlayer"
 ScreenGui.ResetOnSpawn = false
 ScreenGui.IgnoreGuiInset = true
 ScreenGui.Parent = playerGui
 
 local MainFrame = Instance.new("Frame")
-MainFrame.Name = "MainFrame"
-MainFrame.Size = UDim2.new(0, FRAME_W, 0, FRAME_H)
-MainFrame.Position = UDim2.new(0.5, -FRAME_W / 2, 0.5, -FRAME_H / 2)
-MainFrame.BackgroundColor3 = Theme.Background
+MainFrame.Size = UDim2.new(0, FW, 0, FH)
+MainFrame.Position = UDim2.new(0.5, -FW/2, 0.5, -FH/2)
+MainFrame.BackgroundColor3 = Theme.Bg
 MainFrame.BorderSizePixel = 0
 MainFrame.Active = true
 MainFrame.Visible = not isMobile
 MainFrame.Parent = ScreenGui
-Instance.new("UICorner", MainFrame).CornerRadius = UDim.new(0, 8)
-local MainStroke = Instance.new("UIStroke")
-MainStroke.Color = Theme.Line
-MainStroke.Thickness = 1
-MainStroke.Parent = MainFrame
+Instance.new("UICorner", MainFrame).CornerRadius = UDim.new(0, 10)
+local stroke = Instance.new("UIStroke")
+stroke.Color = Theme.Line
+stroke.Parent = MainFrame
 
 local function makeDraggable(gui, handle)
     local dragging, dragInput, dragStart, startPos
@@ -384,282 +315,265 @@ local function makeDraggable(gui, handle)
 end
 
 local TopBar = Instance.new("Frame")
-TopBar.Size = UDim2.new(1, 0, 0, 44)
+TopBar.Size = UDim2.new(1, 0, 0, 48)
 TopBar.BackgroundTransparency = 1
 TopBar.Parent = MainFrame
 
 local Title = Instance.new("TextLabel")
 Title.Size = UDim2.new(0, 200, 1, 0)
-Title.Position = UDim2.new(0, 15, 0, 0)
+Title.Position = UDim2.new(0, 16, 0, 0)
 Title.BackgroundTransparency = 1
-Title.Text = "Autofarm"
+Title.Text = "Funky Friday"
 Title.TextColor3 = Theme.Accent
 Title.Font = Enum.Font.GothamBold
-Title.TextSize = 18
+Title.TextSize = 20
 Title.TextXAlignment = Enum.TextXAlignment.Left
 Title.Parent = TopBar
 
 local CloseBtn = Instance.new("TextButton")
-CloseBtn.Size = UDim2.new(0, 40, 0, 40)
-CloseBtn.Position = UDim2.new(1, -46, 0.5, -20)
+CloseBtn.Size = UDim2.new(0, 44, 0, 44)
+CloseBtn.Position = UDim2.new(1, -50, 0.5, -22)
 CloseBtn.BackgroundColor3 = Theme.Card
 CloseBtn.Text = "X"
 CloseBtn.TextColor3 = Theme.Text
 CloseBtn.Font = Enum.Font.GothamBold
-CloseBtn.TextSize = 16
+CloseBtn.TextSize = 18
 CloseBtn.Parent = TopBar
-Instance.new("UICorner", CloseBtn).CornerRadius = UDim.new(0, 6)
+Instance.new("UICorner", CloseBtn).CornerRadius = UDim.new(0, 8)
 
 makeDraggable(MainFrame, TopBar)
 
-if SHOW_SIDEBAR then
-    local Sidebar = Instance.new("Frame")
-    Sidebar.Size = UDim2.new(0, SIDEBAR_W, 1, -54)
-    Sidebar.Position = UDim2.new(0, 10, 0, 48)
-    Sidebar.BackgroundColor3 = Theme.Sidebar
-    Sidebar.BorderSizePixel = 0
-    Sidebar.Parent = MainFrame
-    Instance.new("UICorner", Sidebar).CornerRadius = UDim.new(0, 6)
+local Scroll = Instance.new("ScrollingFrame")
+Scroll.Size = UDim2.new(1, -20, 1, -60)
+Scroll.Position = UDim2.new(0, 10, 0, 52)
+Scroll.BackgroundTransparency = 1
+Scroll.ScrollBarThickness = 6
+Scroll.ScrollBarImageColor3 = Theme.Line
+Scroll.CanvasSize = UDim2.new(0, 0, 0, 0)
+Scroll.AutomaticCanvasSize = Enum.AutomaticSize.Y
+Scroll.Parent = MainFrame
+local List = Instance.new("UIListLayout")
+List.Padding = UDim.new(0, 10)
+List.SortOrder = Enum.SortOrder.LayoutOrder
+List.Parent = Scroll
 
-    local Logo = Instance.new("TextLabel")
-    Logo.Size = UDim2.new(1, -20, 0, 40)
-    Logo.Position = UDim2.new(0, 10, 0, 5)
-    Logo.BackgroundTransparency = 1
-    Logo.Text = "Jolo Hub"
-    Logo.TextColor3 = Theme.Text
-    Logo.Font = Enum.Font.GothamBold
-    Logo.TextSize = 18
-    Logo.TextXAlignment = Enum.TextXAlignment.Left
-    Logo.Parent = Sidebar
-
-    local VersionTag = Instance.new("TextLabel")
-    VersionTag.Size = UDim2.new(0, 34, 0, 16)
-    VersionTag.Position = UDim2.new(0, 88, 0, 12)
-    VersionTag.BackgroundColor3 = Theme.Accent
-    VersionTag.Text = "v1.2"
-    VersionTag.TextColor3 = Color3.new(0, 0, 0)
-    VersionTag.Font = Enum.Font.GothamBold
-    VersionTag.TextSize = 10
-    VersionTag.Parent = Logo
-    Instance.new("UICorner", VersionTag).CornerRadius = UDim.new(0, 4)
-
-    local SidebarList = Instance.new("Frame")
-    SidebarList.Size = UDim2.new(1, 0, 1, -50)
-    SidebarList.Position = UDim2.new(0, 0, 0, 50)
-    SidebarList.BackgroundTransparency = 1
-    SidebarList.Parent = Sidebar
-    local ListLayout = Instance.new("UIListLayout")
-    ListLayout.Padding = UDim.new(0, 2)
-    ListLayout.SortOrder = Enum.SortOrder.LayoutOrder
-    ListLayout.Parent = SidebarList
-
-    local function CreateSidebarButton(text, isCategory, isActive)
-        local btn = Instance.new("TextButton")
-        btn.Size = UDim2.new(1, 0, 0, 32)
-        btn.BackgroundTransparency = 1
-        btn.Text = isCategory and ("  " .. text) or ("    " .. text)
-        btn.TextColor3 = isActive and Theme.Accent or (isCategory and Theme.Text or Theme.SubText)
-        btn.Font = isCategory and Enum.Font.GothamBold or Enum.Font.Gotham
-        btn.TextSize = isCategory and 12 or 13
-        btn.TextXAlignment = Enum.TextXAlignment.Left
-        btn.Parent = SidebarList
-        if isActive then
-            local indicator = Instance.new("Frame")
-            indicator.Size = UDim2.new(0, 2, 1, 0)
-            indicator.BackgroundColor3 = Theme.Accent
-            indicator.BorderSizePixel = 0
-            indicator.Parent = btn
-        end
-    end
-
-    CreateSidebarButton("MAIN", true, false)
-    CreateSidebarButton("Home", false, false)
-    CreateSidebarButton("Kaitun", false, false)
-    CreateSidebarButton("Autofarm", false, true)
-    CreateSidebarButton("FARMING", true, false)
-    CreateSidebarButton("Missions", false, false)
+local function makeCard(titleText, height)
+    local c = Instance.new("Frame")
+    c.Size = UDim2.new(1, -6, 0, height)
+    c.BackgroundColor3 = Theme.Bg
+    c.BorderSizePixel = 0
+    c.Parent = Scroll
+    Instance.new("UICorner", c).CornerRadius = UDim.new(0, 8)
+    local s = Instance.new("UIStroke")
+    s.Color = Theme.Line
+    s.Parent = c
+    local t = Instance.new("TextLabel")
+    t.Size = UDim2.new(1, -20, 0, 30)
+    t.Position = UDim2.new(0, 14, 0, 8)
+    t.BackgroundTransparency = 1
+    t.Text = titleText
+    t.TextColor3 = Theme.Accent
+    t.Font = Enum.Font.GothamBold
+    t.TextSize = 14
+    t.TextXAlignment = Enum.TextXAlignment.Left
+    t.Parent = c
+    local l = Instance.new("Frame")
+    l.Size = UDim2.new(1, -28, 0, 1)
+    l.Position = UDim2.new(0, 14, 0, 36)
+    l.BackgroundColor3 = Theme.Line
+    l.BorderSizePixel = 0
+    l.Parent = c
+    return c
 end
 
-local ContentArea = Instance.new("ScrollingFrame")
-ContentArea.Size = UDim2.new(1, -(SIDEBAR_W + 20), 1, -54)
-ContentArea.Position = UDim2.new(0, SIDEBAR_W + 10, 0, 48)
-ContentArea.BackgroundTransparency = 1
-ContentArea.BorderSizePixel = 0
-ContentArea.ScrollBarThickness = 6
-ContentArea.ScrollBarImageColor3 = Theme.Line
-ContentArea.ScrollingDirection = Enum.ScrollingDirection.Y
-ContentArea.CanvasSize = UDim2.new(0, 0, 0, 0)
-ContentArea.AutomaticCanvasSize = Enum.AutomaticSize.Y
-ContentArea.Parent = MainFrame
-
-local ContentLayout = Instance.new("UIListLayout")
-ContentLayout.Padding = UDim.new(0, 10)
-ContentLayout.SortOrder = Enum.SortOrder.LayoutOrder
-ContentLayout.Parent = ContentArea
-
-local function CreateCard(titleText, toggleCount)
-    local height = 45 + toggleCount * (ROW_H + 6)
-    local card = Instance.new("Frame")
-    card.Size = UDim2.new(1, -6, 0, height)
-    card.BackgroundColor3 = Theme.Background
-    card.BorderSizePixel = 0
-    card.Parent = ContentArea
-    Instance.new("UICorner", card).CornerRadius = UDim.new(0, 6)
-    local stroke = Instance.new("UIStroke")
-    stroke.Color = Theme.Line
-    stroke.Parent = card
-    local title = Instance.new("TextLabel")
-    title.Size = UDim2.new(1, -20, 0, 30)
-    title.Position = UDim2.new(0, 15, 0, 8)
-    title.BackgroundTransparency = 1
-    title.Text = titleText
-    title.TextColor3 = Theme.Accent
-    title.Font = Enum.Font.GothamBold
-    title.TextSize = 14
-    title.TextXAlignment = Enum.TextXAlignment.Left
-    title.Parent = card
-    local line = Instance.new("Frame")
-    line.Size = UDim2.new(1, -30, 0, 1)
-    line.Position = UDim2.new(0, 15, 0, 36)
-    line.BackgroundColor3 = Theme.Line
-    line.BorderSizePixel = 0
-    line.Parent = card
-    return card
-end
-
-local function CreateToggle(parent, nameText, descText, yPos, initialState, callback)
+local function makeToggle(parent, nameText, descText, y, initial, cb)
     local row = Instance.new("TextButton")
-    row.Size = UDim2.new(1, -20, 0, ROW_H)
-    row.Position = UDim2.new(0, 10, 0, yPos)
+    row.Size = UDim2.new(1, -20, 0, ROW)
+    row.Position = UDim2.new(0, 10, 0, y)
     row.BackgroundTransparency = 1
-    row.AutoButtonColor = false
     row.Text = ""
+    row.AutoButtonColor = false
     row.Parent = parent
 
-    local name = Instance.new("TextLabel")
-    name.Size = UDim2.new(1, -70, 0, 20)
-    name.Position = UDim2.new(0, 8, 0, (isMobile and 8) or 4)
-    name.BackgroundTransparency = 1
-    name.Text = nameText
-    name.TextColor3 = Theme.Text
-    name.Font = Enum.Font.Gotham
-    name.TextSize = isMobile and 15 or 14
-    name.TextXAlignment = Enum.TextXAlignment.Left
-    name.Parent = row
+    local n = Instance.new("TextLabel")
+    n.Size = UDim2.new(1, -70, 0, 20)
+    n.Position = UDim2.new(0, 8, 0, isMobile and 8 or 6)
+    n.BackgroundTransparency = 1
+    n.Text = nameText
+    n.TextColor3 = Theme.Text
+    n.Font = Enum.Font.Gotham
+    n.TextSize = isMobile and 15 or 14
+    n.TextXAlignment = Enum.TextXAlignment.Left
+    n.Parent = row
 
-    local desc = Instance.new("TextLabel")
-    desc.Size = UDim2.new(1, -70, 0, 16)
-    desc.Position = UDim2.new(0, 8, 0, (isMobile and 28) or 22)
-    desc.BackgroundTransparency = 1
-    desc.Text = descText
-    desc.TextColor3 = Theme.SubText
-    desc.Font = Enum.Font.Gotham
-    desc.TextSize = isMobile and 12 or 11
-    desc.TextXAlignment = Enum.TextXAlignment.Left
-    desc.Parent = row
+    local d = Instance.new("TextLabel")
+    d.Size = UDim2.new(1, -70, 0, 16)
+    d.Position = UDim2.new(0, 8, 0, isMobile and 28 or 24)
+    d.BackgroundTransparency = 1
+    d.Text = descText
+    d.TextColor3 = Theme.Sub
+    d.Font = Enum.Font.Gotham
+    d.TextSize = isMobile and 12 or 11
+    d.TextXAlignment = Enum.TextXAlignment.Left
+    d.Parent = row
 
-    local state = initialState and true or false
-    local SW_W = isMobile and 46 or 36
-    local SW_H = isMobile and 22 or 18
-    local DOT = isMobile and 18 or 14
+    local state = initial and true or false
+    local sw = isMobile and 46 or 36
+    local sh = isMobile and 22 or 18
+    local dot = isMobile and 18 or 14
 
-    local switchBg = Instance.new("Frame")
-    switchBg.Size = UDim2.new(0, SW_W, 0, SW_H)
-    switchBg.Position = UDim2.new(1, -(SW_W + 8), 0.5, -SW_H / 2)
-    switchBg.BackgroundColor3 = state and Theme.Accent or Theme.ToggleOff
-    switchBg.Parent = row
-    Instance.new("UICorner", switchBg).CornerRadius = UDim.new(1, 0)
+    local bg = Instance.new("Frame")
+    bg.Size = UDim2.new(0, sw, 0, sh)
+    bg.Position = UDim2.new(1, -(sw + 8), 0.5, -sh/2)
+    bg.BackgroundColor3 = state and Theme.Accent or Theme.Off
+    bg.Parent = row
+    Instance.new("UICorner", bg).CornerRadius = UDim.new(1, 0)
 
-    local switchDot = Instance.new("Frame")
-    switchDot.Size = UDim2.new(0, DOT, 0, DOT)
-    switchDot.Position = state and UDim2.new(1, -(DOT + 2), 0.5, -DOT / 2) or UDim2.new(0, 2, 0.5, -DOT / 2)
-    switchDot.BackgroundColor3 = Theme.Background
-    switchDot.Parent = switchBg
-    Instance.new("UICorner", switchDot).CornerRadius = UDim.new(1, 0)
+    local dotF = Instance.new("Frame")
+    dotF.Size = UDim2.new(0, dot, 0, dot)
+    dotF.Position = state and UDim2.new(1, -(dot + 2), 0.5, -dot/2) or UDim2.new(0, 2, 0.5, -dot/2)
+    dotF.BackgroundColor3 = Theme.Bg
+    dotF.Parent = bg
+    Instance.new("UICorner", dotF).CornerRadius = UDim.new(1, 0)
 
     local function render()
-        switchBg.BackgroundColor3 = state and Theme.Accent or Theme.ToggleOff
-        switchDot.Position = state and UDim2.new(1, -(DOT + 2), 0.5, -DOT / 2) or UDim2.new(0, 2, 0.5, -DOT / 2)
+        bg.BackgroundColor3 = state and Theme.Accent or Theme.Off
+        dotF.Position = state and UDim2.new(1, -(dot + 2), 0.5, -dot/2) or UDim2.new(0, 2, 0.5, -dot/2)
     end
 
     row.MouseButton1Click:Connect(function()
         state = not state
         render()
-        if callback then pcall(callback, state) end
+        if cb then pcall(cb, state) end
     end)
 end
 
--- COMBAT
-local CombatCard = CreateCard("✦ COMBAT", 2)
-CreateToggle(CombatCard, "Kill Aura", "Faces and swings at the nearest titan.", 44, CONFIG.KillAura,
-    function(v) CONFIG.KillAura = v end)
-CreateToggle(CombatCard, "Auto Reload Blades", "Re-equips your blade to trigger reload.", 44 + ROW_H + 6, CONFIG.AutoReloadBlades,
-    function(v) CONFIG.AutoReloadBlades = v end)
+-- Cards
+local SettingsCard = makeCard("✦ SETTINGS", 44 + ROW * 2 + 12)
 
--- ODM
-local ODMCard = CreateCard("✦ ODM (perk-based)", 4)
-CreateToggle(ODMCard, "Infinite Gas", "Attempts to max gas via attribute.", 44, CONFIG.InfiniteGas,
-    function(v) CONFIG.InfiniteGas = v end)
-CreateToggle(ODMCard, "Infinite Boost", "Attempts to max boost via attribute.", 44 + ROW_H + 6, CONFIG.InfiniteBoost,
-    function(v) CONFIG.InfiniteBoost = v end)
-CreateToggle(ODMCard, "No Hook Cooldown", "Attempts to zero hook cooldown attribute.", 44 + (ROW_H + 6) * 2, CONFIG.NoHookCooldown,
-    function(v) CONFIG.NoHookCooldown = v end)
-CreateToggle(ODMCard, "Instant Hook", "Attempts to raise hook speed attribute.", 44 + (ROW_H + 6) * 3, CONFIG.InstantHook,
-    function(v) CONFIG.InstantHook = v end)
+makeToggle(SettingsCard, "Auto Play", "Automatically hit notes while in a song.", 44, CONFIG.AutoPlay, function(v)
+    CONFIG.AutoPlay = v
+    if v then startAutoPlay() else stopAutoPlay() end
+end)
 
--- MOVEMENT
-local MoveCard = CreateCard("✦ MOVEMENT", 1)
-CreateToggle(MoveCard, "Apply WalkSpeed / JumpPower", "Sets humanoid WalkSpeed and JumpPower.", 44, CONFIG.ApplyMovement,
-    function(v) CONFIG.ApplyMovement = v end)
+makeToggle(SettingsCard, "Hold Long Notes", "Keeps keys held down for hold notes.", 44 + ROW + 6, CONFIG.HoldLongNotes, function(v)
+    CONFIG.HoldLongNotes = v
+end)
 
--- VISUALS
-local VisualCard = CreateCard("✦ VISUALS", 1)
-CreateToggle(VisualCard, "Titan ESP", "Name tags over every titan.", 44, CONFIG.TitanESP,
-    function(v) CONFIG.TitanESP = v end)
+-- Precision card
+local PrecisionCard = makeCard("✦ PRECISION", 44 + 70)
 
--- UTILITY
-local UtilCard = CreateCard("✦ UTILITY", 1)
-CreateToggle(UtilCard, "Anti-AFK", "Prevents idle kick via VirtualUser.", 44, CONFIG.AntiAFK,
-    function(v) CONFIG.AntiAFK = v end)
+local precisionLabel = Instance.new("TextLabel")
+precisionLabel.Size = UDim2.new(1, -20, 0, 22)
+precisionLabel.Position = UDim2.new(0, 10, 0, 44)
+precisionLabel.BackgroundTransparency = 1
+precisionLabel.Text = "Accuracy: 0.40 (lower = earlier)"
+precisionLabel.TextColor3 = Theme.Text
+precisionLabel.Font = Enum.Font.Gotham
+precisionLabel.TextSize = 13
+precisionLabel.TextXAlignment = Enum.TextXAlignment.Left
+precisionLabel.Parent = PrecisionCard
 
--- FLOAT BUTTON (mobile)
+local precisionBox = Instance.new("TextBox")
+precisionBox.Size = UDim2.new(0, 80, 0, 30)
+precisionBox.Position = UDim2.new(1, -90, 0, 44)
+precisionBox.BackgroundColor3 = Theme.Card
+precisionBox.Text = tostring(CONFIG.Accuracy)
+precisionBox.TextColor3 = Theme.Text
+precisionBox.Font = Enum.Font.Gotham
+precisionBox.TextSize = 13
+precisionBox.Parent = PrecisionCard
+Instance.new("UICorner", precisionBox).CornerRadius = UDim.new(0, 6)
+precisionBox.FocusLost:Connect(function()
+    local num = tonumber(precisionBox.Text)
+    if num then
+        num = math.clamp(num, 0, 1)
+        CONFIG.Accuracy = num
+        precisionBox.Text = string.format("%.2f", num)
+        precisionLabel.Text = string.format("Accuracy: %.2f (lower = earlier)", num)
+    else
+        precisionBox.Text = tostring(CONFIG.Accuracy)
+    end
+end)
+
+local HumanizeCard = makeCard("✦ HUMANIZATION", 44 + ROW)
+
+makeToggle(HumanizeCard, "Humanization", "Randomises press timing slightly.", 44, CONFIG.Humanization, function(v)
+    CONFIG.Humanization = v
+end)
+
+-- Side card
+local SideCard = makeCard("✦ SIDE", 44 + 44)
+
+local sideLabel = Instance.new("TextLabel")
+sideLabel.Size = UDim2.new(1, -20, 0, 30)
+sideLabel.Position = UDim2.new(0, 10, 0, 44)
+sideLabel.BackgroundTransparency = 1
+sideLabel.Text = "Side: Auto-detect"
+sideLabel.TextColor3 = Theme.Text
+sideLabel.Font = Enum.Font.Gotham
+sideLabel.TextSize = 14
+sideLabel.TextXAlignment = Enum.TextXAlignment.Left
+sideLabel.Parent = SideCard
+
+local function setSide(s)
+    State.side = s
+    sideLabel.Text = "Side: " .. s
+end
+
+local leftBtn = Instance.new("TextButton")
+leftBtn.Size = UDim2.new(0, 70, 0, 30)
+leftBtn.Position = UDim2.new(1, -160, 0, 44)
+leftBtn.BackgroundColor3 = Theme.Card
+leftBtn.Text = "Left"
+leftBtn.TextColor3 = Theme.Text
+leftBtn.Font = Enum.Font.GothamBold
+leftBtn.TextSize = 13
+leftBtn.Parent = SideCard
+Instance.new("UICorner", leftBtn).CornerRadius = UDim.new(0, 6)
+leftBtn.MouseButton1Click:Connect(function() setSide("Left") end)
+
+local rightBtn = Instance.new("TextButton")
+rightBtn.Size = UDim2.new(0, 70, 0, 30)
+rightBtn.Position = UDim2.new(1, -80, 0, 44)
+rightBtn.BackgroundColor3 = Theme.Card
+rightBtn.Text = "Right"
+rightBtn.TextColor3 = Theme.Text
+rightBtn.Font = Enum.Font.GothamBold
+rightBtn.TextSize = 13
+rightBtn.Parent = SideCard
+Instance.new("UICorner", rightBtn).CornerRadius = UDim.new(0, 6)
+rightBtn.MouseButton1Click:Connect(function() setSide("Right") end)
+
+-- Mobile float button
 if isMobile then
     local floatBtn = Instance.new("TextButton")
     floatBtn.Size = UDim2.new(0, 56, 0, 56)
     floatBtn.Position = UDim2.new(0, 16, 0.5, -28)
     floatBtn.BackgroundColor3 = Theme.Accent
-    floatBtn.Text = "J"
+    floatBtn.Text = "FF"
     floatBtn.TextColor3 = Color3.new(0, 0, 0)
     floatBtn.Font = Enum.Font.GothamBold
-    floatBtn.TextSize = 22
+    floatBtn.TextSize = 20
     floatBtn.Parent = ScreenGui
     Instance.new("UICorner", floatBtn).CornerRadius = UDim.new(1, 0)
 
-    local startPos, startInputPos, dragging, moved, moveConn
-
-    floatBtn.InputBegan:Connect(function(input)
-        if input.UserInputType ~= Enum.UserInputType.Touch and input.UserInputType ~= Enum.UserInputType.MouseButton1 then return end
-        dragging = true
-        moved = false
-        startPos = floatBtn.Position
-        startInputPos = input.Position
-        if moveConn then moveConn:Disconnect() end
-        moveConn = input.Changed:Connect(function()
-            if input.UserInputState == Enum.UserInputState.Change and dragging then
-                local delta = input.Position - startInputPos
-                if delta.Magnitude > 8 then moved = true end
+    local drag, moved, sp, sip, conn
+    floatBtn.InputBegan:Connect(function(i)
+        if i.UserInputType ~= Enum.UserInputType.Touch and i.UserInputType ~= Enum.UserInputType.MouseButton1 then return end
+        drag = true; moved = false; sp = floatBtn.Position; sip = i.Position
+        if conn then conn:Disconnect() end
+        conn = i.Changed:Connect(function()
+            if i.UserInputState == Enum.UserInputState.Change and drag then
+                local d = i.Position - sip
+                if d.Magnitude > 8 then moved = true end
                 if moved then
-                    floatBtn.Position = UDim2.new(
-                        startPos.X.Scale, startPos.X.Offset + delta.X,
-                        startPos.Y.Scale, startPos.Y.Offset + delta.Y
-                    )
+                    floatBtn.Position = UDim2.new(sp.X.Scale, sp.X.Offset + d.X, sp.Y.Scale, sp.Y.Offset + d.Y)
                 end
-            elseif input.UserInputState == Enum.UserInputState.End then
-                dragging = false
-                if not moved then
-                    MainFrame.Visible = not MainFrame.Visible
-                end
-                if moveConn then moveConn:Disconnect() end
+            elseif i.UserInputState == Enum.UserInputState.End then
+                drag = false
+                if not moved then MainFrame.Visible = not MainFrame.Visible end
+                if conn then conn:Disconnect() end
             end
         end)
     end)
@@ -669,22 +583,22 @@ end
 -- CLEANUP
 -- ============================================================
 local function unload()
-    if Unloaded then return end
-    Unloaded = true
+    if State.unloaded then return end
+    State.unloaded = true
     CONFIG.Enabled = false
 
-    clearESP()
+    stopAutoPlay()
     for _, c in ipairs(Connections) do
         pcall(function() c:Disconnect() end)
     end
     if ScreenGui then ScreenGui:Destroy() end
-    if getgenv().AOTR_JoloHub_Unload == unload then
-        getgenv().AOTR_JoloHub_Unload = nil
+    if getgenv().FF_AutoPlayer_Unload == unload then
+        getgenv().FF_AutoPlayer_Unload = nil
     end
-    print("[AOTR] Jolo Hub unloaded.")
+    print("[FF] Auto Player unloaded.")
 end
 
-getgenv().AOTR_JoloHub_Unload = unload
+getgenv().FF_AutoPlayer_Unload = unload
 
 CloseBtn.MouseButton1Click:Connect(function()
     MainFrame.Visible = false
@@ -693,19 +607,14 @@ end)
 addConnection(UserInputService.InputBegan:Connect(function(input, gp)
     if gp then return end
     if input.KeyCode == Enum.KeyCode.F2 then unload() end
-    if input.KeyCode == Enum.KeyCode.F1 then
-        MainFrame.Visible = not MainFrame.Visible
+    if input.KeyCode == Enum.KeyCode.F1 then MainFrame.Visible = not MainFrame.Visible end
+    if input.KeyCode == CONFIG.KeyToggle then
+        CONFIG.AutoPlay = not CONFIG.AutoPlay
+        if CONFIG.AutoPlay then startAutoPlay() else stopAutoPlay() end
     end
 end))
 
 -- ============================================================
 -- STARTUP
 -- ============================================================
-task.spawn(killAuraLoop)
-task.spawn(reloadLoop)
-task.spawn(odmLoop)
-task.spawn(movementLoop)
-task.spawn(espLoop)
-setupAntiAFK()
-
-print("[AOTR] Jolo Hub v1.2 loaded. Mobile:", isMobile)
+print("[FF] Auto Player loaded. VirtualInputManager:", hasVirtualInputManager, "Mobile:", isMobile)
