@@ -1,51 +1,50 @@
--- LUAU-OL :: AOTR Jolo Hub
--- Player-side combat and ODM automation for Attack on Titan Revolution, wrapped in the Jolo Hub UI.
--- Close button or [F2] unloads. MIT.
+-- LUAU-OL :: AOTR Jolo Hub (Mobile/Delta)
+-- Player-side combat automation + titan ESP for Attack on Titan Revolution.
+-- Touch-sized UI, BillboardGui ESP, Tool:Activate combat. No Drawing/getconnections needed.
+-- Float button toggles UI on mobile. [F2] unloads. MIT.
 
 local CONFIG = {
     Enabled = true,
+    -- Combat
     KillAura = false,
-    KillAuraRange = 80,
+    KillAuraRange = 100,
     KillAuraInterval = 0.15,
     AutoReloadBlades = false,
-    AutoRefillGas = false,
-    InfiniteGas = false,
-    InfiniteBoost = false,
-    NoHookCooldown = false,
-    InstantHook = false,
+    ReloadInterval = 2.5,
+    -- Visuals
     TitanESP = false,
     ESPColor = Color3.fromRGB(245, 194, 17),
+    -- Utility
     AntiAFK = true,
 }
 
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
 local UserInputService = game:GetService("UserInputService")
-local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local VirtualUser = game:GetService("VirtualUser")
 local Workspace = game:GetService("Workspace")
 
 local player = Players.LocalPlayer
 local playerGui = player:WaitForChild("PlayerGui")
 
+-- Mobile detection (works on Delta mobile and Studio phone emulator)
+local isMobile = UserInputService.TouchEnabled and not UserInputService.MouseEnabled
+
+-- ============================================================
+-- STATE & TRACKING
+-- ============================================================
 local Connections = {}
-local RenderBindings = {}
-local Drawings = {}
+local ESP_TAGS = {}
 local Unloaded = false
 
-local function addConnection(c) table.insert(Connections, c); return c end
-local function addRender(name, priority, fn)
-    RunService:BindToRenderStep(name, priority, fn)
-    table.insert(RenderBindings, name)
+local function addConnection(c)
+    table.insert(Connections, c)
+    return c
 end
-local function addDrawing(d) table.insert(Drawings, d); return d end
 
--- API probes
-local hasGetConnections = pcall(function() return type(getconnections) == "function" end)
-local hasDrawing = pcall(function() return Drawing and Drawing.new ~= nil end)
-if not hasGetConnections then warn("[AOTR] getconnections unavailable - Anti-AFK disabled.") end
-if not hasDrawing then warn("[AOTR] Drawing API unavailable - Titan ESP disabled.") end
-
--- Helpers (refetch at point of use)
+-- ============================================================
+-- HELPERS
+-- ============================================================
 local function getChar() return player.Character end
 local function getHumanoid()
     local c = getChar()
@@ -59,9 +58,14 @@ end
 local function getTitans()
     local t = {}
     for _, obj in ipairs(Workspace:GetDescendants()) do
-        if obj:IsA("Model") and (obj.Name:lower():find("titan") or obj:GetAttribute("IsTitan")) then
+        if obj:IsA("Model") then
             local hum = obj:FindFirstChildOfClass("Humanoid")
-            if hum and hum.Health > 0 then table.insert(t, obj) end
+            if hum and hum.Health > 0 then
+                local lower = obj.Name:lower()
+                if lower:find("titan") or obj:GetAttribute("IsTitan") then
+                    table.insert(t, obj)
+                end
+            end
         end
     end
     return t
@@ -81,39 +85,56 @@ local function getNearestTitan(range)
     return nearest
 end
 
-local function getCombatRemote()
-    for _, obj in ipairs(ReplicatedStorage:GetDescendants()) do
-        if obj:IsA("RemoteEvent") and (obj.Name:lower():find("combat") or obj.Name:lower():find("hit") or obj.Name:lower():find("attack")) then
-            return obj
+local function getBladeTool()
+    local char = getChar()
+    if not char then return nil end
+    local fallback
+    for _, obj in ipairs(char:GetChildren()) do
+        if obj:IsA("Tool") then
+            local lower = obj.Name:lower()
+            if lower:find("blade") or lower:find("sword") or lower:find("weapon") then
+                return obj
+            end
+            fallback = fallback or obj
         end
     end
-    return nil
+    return fallback
 end
-local CombatRemote = getCombatRemote()
-if not CombatRemote then warn("[AOTR] No combat remote found - Kill Aura will no-op.") end
 
--- Background loops
+-- ============================================================
+-- COMBAT (Tool:Activate — same path as a real tap)
+-- ============================================================
+local function faceTarget(target)
+    local root = getRoot()
+    local hrp = target:FindFirstChild("HumanoidRootPart")
+    if root and hrp then
+        local look = CFrame.lookAt(
+            root.Position,
+            Vector3.new(hrp.Position.X, root.Position.Y, hrp.Position.Z)
+        )
+        root.CFrame = look
+    end
+end
+
+local function swingBlade()
+    local tool = getBladeTool()
+    if tool then
+        pcall(function() tool:Activate() end)
+        return true
+    end
+    return false
+end
+
 local function killAuraLoop()
     while CONFIG.Enabled and not Unloaded do
-        if CONFIG.KillAura and CombatRemote then
+        if CONFIG.KillAura then
             local titan = getNearestTitan(CONFIG.KillAuraRange)
             if titan then
-                pcall(function() CombatRemote:FireServer(titan, 1) end)
+                faceTarget(titan)
+                swingBlade()
             end
         end
         task.wait(CONFIG.KillAuraInterval)
-    end
-end
-
-local function refillLoop()
-    while CONFIG.Enabled and not Unloaded do
-        if CONFIG.AutoRefillGas then
-            local hum = getHumanoid()
-            if hum then
-                pcall(function() hum:ChangeState(Enum.HumanoidStateType.Jumping) end)
-            end
-        end
-        task.wait(2)
     end
 end
 
@@ -121,90 +142,114 @@ local function reloadLoop()
     while CONFIG.Enabled and not Unloaded do
         if CONFIG.AutoReloadBlades then
             local char = getChar()
-            if char then
-                local blades = char:FindFirstChild("Blades")
-                if blades and blades:IsA("Tool") then
-                    pcall(function() blades:Activate() end)
-                end
+            local hum = getHumanoid()
+            local blade = getBladeTool()
+            if char and hum and blade then
+                pcall(function()
+                    -- Move to backpack then back to character forces a re-equip + reload
+                    local backpack = player:FindFirstChildOfClass("Backpack")
+                    if backpack then
+                        blade.Parent = backpack
+                        task.wait(0.05)
+                        blade.Parent = char
+                    end
+                end)
             end
         end
-        task.wait(3)
+        task.wait(CONFIG.ReloadInterval)
     end
 end
 
--- ESP render
+-- ============================================================
+-- TITAN ESP (BillboardGui — no Drawing API needed)
+-- ============================================================
+local function clearESP()
+    for _, tag in pairs(ESP_TAGS) do
+        if tag and tag.Parent then pcall(function() tag:Destroy() end) end
+    end
+    ESP_TAGS = {}
+end
+
 local function updateESP()
-    if not hasDrawing then return end
     if not CONFIG.TitanESP then
-        for _, d in ipairs(Drawings) do d.Visible = false end
+        clearESP()
         return
     end
-    local cam = Workspace.CurrentCamera
-    if not cam then return end
+
     local titans = getTitans()
+    local seen = {}
 
-    while #Drawings < #titans * 2 do
-        local box = addDrawing(Drawing.new("Square"))
-        box.Thickness = 1
-        box.Color = CONFIG.ESPColor
-        box.Filled = false
-        local label = addDrawing(Drawing.new("Text"))
-        label.Size = 14
-        label.Color = CONFIG.ESPColor
-        label.Center = true
-        label.Outline = true
-    end
-
-    for i, titan in ipairs(titans) do
-        local box = Drawings[(i - 1) * 2 + 1]
-        local label = Drawings[(i - 1) * 2 + 2]
+    for _, titan in ipairs(titans) do
         local hrp = titan:FindFirstChild("HumanoidRootPart")
-        if hrp and box and label then
-            local pos, onScreen = cam:WorldToViewportPoint(hrp.Position)
-            if onScreen then
-                local size = 1200 / math.max(pos.Z, 1)
-                box.Size = Vector2.new(size, size * 1.5)
-                box.Position = Vector2.new(pos.X - size / 2, pos.Y - size * 0.75)
-                box.Visible = true
+        if hrp then
+            local existing = ESP_TAGS[titan]
+            if not existing or not existing.Parent then
+                local billboard = Instance.new("BillboardGui")
+                billboard.Name = "AOTR_ESP"
+                billboard.Size = UDim2.new(0, 120, 0, 36)
+                billboard.StudsOffset = Vector3.new(0, 3, 0)
+                billboard.AlwaysOnTop = true
+                billboard.LightInfluence = 0
+                billboard.Adornee = hrp
+
+                local label = Instance.new("TextLabel")
+                label.Size = UDim2.new(1, 0, 1, 0)
+                label.BackgroundColor3 = Color3.fromRGB(0, 0, 0)
+                label.BackgroundTransparency = 0.45
+                label.TextColor3 = CONFIG.ESPColor
                 label.Text = titan.Name
-                label.Position = Vector2.new(pos.X, pos.Y - size)
-                label.Visible = true
+                label.Font = Enum.Font.GothamBold
+                label.TextSize = 14
+                label.TextScaled = false
+                label.Parent = billboard
+                Instance.new("UICorner", label).CornerRadius = UDim.new(0, 4)
+
+                billboard.Parent = hrp
+                ESP_TAGS[titan] = billboard
             else
-                box.Visible = false
-                label.Visible = false
+                existing.Adornee = hrp
             end
+            seen[titan] = true
         end
     end
-    for i = #titans * 2 + 1, #Drawings do
-        Drawings[i].Visible = false
+
+    for titan, tag in pairs(ESP_TAGS) do
+        if not seen[titan] then
+            if tag and tag.Parent then pcall(function() tag:Destroy() end) end
+            ESP_TAGS[titan] = nil
+        end
     end
 end
 
--- ODM render
-local function updateODM()
-    local hum = getHumanoid()
-    if not hum then return end
-    if CONFIG.InfiniteGas then pcall(function() hum:SetAttribute("Gas", math.huge) end) end
-    if CONFIG.InfiniteBoost then pcall(function() hum:SetAttribute("Boost", math.huge) end) end
-    if CONFIG.NoHookCooldown then pcall(function() hum:SetAttribute("HookCooldown", 0) end) end
-    if CONFIG.InstantHook then pcall(function() hum:SetAttribute("HookSpeed", 999) end) end
+local function espLoop()
+    while CONFIG.Enabled and not Unloaded do
+        pcall(updateESP)
+        task.wait(0.4)
+    end
 end
 
-local function applyAntiAFK()
-    if not hasGetConnections then return end
-    pcall(function()
-        for _, conn in ipairs(getconnections(player.Idled)) do
-            if conn.Disable then conn:Disable() end
-        end
-    end)
+-- ============================================================
+-- ANTI-AFK (VirtualUser — works on Delta + mobile)
+-- ============================================================
+local function setupAntiAFK()
+    addConnection(player.Idled:Connect(function()
+        if not CONFIG.AntiAFK then return end
+        pcall(function()
+            VirtualUser:Button2Down(Vector2.new(0, 0), Workspace.CurrentCamera.CFrame)
+            task.wait(1)
+            VirtualUser:Button2Up(Vector2.new(0, 0), Workspace.CurrentCamera.CFrame)
+        end)
+    end))
 end
 
--- Prior instance guard
+-- ============================================================
+-- PRIOR INSTANCE GUARD
+-- ============================================================
 local oldUnload = getgenv().AOTR_JoloHub_Unload
 if type(oldUnload) == "function" then pcall(oldUnload) end
 
 -- ============================================================
--- UI (Jolo Hub replica)
+-- UI
 -- ============================================================
 local Theme = {
     Background = Color3.fromRGB(20, 20, 20),
@@ -217,18 +262,27 @@ local Theme = {
     Line       = Color3.fromRGB(40, 40, 40),
 }
 
+local viewport = Workspace.CurrentCamera and Workspace.CurrentCamera.ViewportSize or Vector2.new(800, 600)
+local FRAME_W = isMobile and math.clamp(viewport.X - 24, 300, 560) or 650
+local FRAME_H = isMobile and math.clamp(viewport.Y - 60, 340, 520) or 450
+local ROW_H = isMobile and 52 or 40
+local SHOW_SIDEBAR = not isMobile
+local SIDEBAR_W = SHOW_SIDEBAR and 160 or 0
+
 local ScreenGui = Instance.new("ScreenGui")
 ScreenGui.Name = "JoloHubUI"
 ScreenGui.ResetOnSpawn = false
+ScreenGui.IgnoreGuiInset = true
 ScreenGui.Parent = playerGui
 
 local MainFrame = Instance.new("Frame")
 MainFrame.Name = "MainFrame"
-MainFrame.Size = UDim2.new(0, 650, 0, 450)
-MainFrame.Position = UDim2.new(0.5, -325, 0.5, -225)
+MainFrame.Size = UDim2.new(0, FRAME_W, 0, FRAME_H)
+MainFrame.Position = UDim2.new(0.5, -FRAME_W / 2, 0.5, -FRAME_H / 2)
 MainFrame.BackgroundColor3 = Theme.Background
 MainFrame.BorderSizePixel = 0
 MainFrame.Active = true
+MainFrame.Visible = not isMobile
 MainFrame.Parent = ScreenGui
 Instance.new("UICorner", MainFrame).CornerRadius = UDim.new(0, 8)
 local MainStroke = Instance.new("UIStroke")
@@ -236,36 +290,47 @@ MainStroke.Color = Theme.Line
 MainStroke.Thickness = 1
 MainStroke.Parent = MainFrame
 
-local dragging, dragInput, dragStart, startPos
-addConnection(MainFrame.InputBegan:Connect(function(input)
-    if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
-        dragging = true
-        dragStart = input.Position
-        startPos = MainFrame.Position
-        addConnection(input.Changed:Connect(function()
-            if input.UserInputState == Enum.UserInputState.End then dragging = false end
-        end))
-    end
-end))
-addConnection(MainFrame.InputChanged:Connect(function(input)
-    if input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch then
-        dragInput = input
-    end
-end))
-addConnection(UserInputService.InputChanged:Connect(function(input)
-    if input == dragInput and dragging then
-        local delta = input.Position - dragStart
-        MainFrame.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + delta.X, startPos.Y.Scale, startPos.Y.Offset + delta.Y)
-    end
-end))
+-- Drag helper
+local function makeDraggable(gui, handle)
+    local dragging, dragInput, dragStart, startPos
+    addConnection(handle.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+            dragging = true
+            dragStart = input.Position
+            startPos = gui.Position
+            local endConn
+            endConn = input.Changed:Connect(function()
+                if input.UserInputState == Enum.UserInputState.End then
+                    dragging = false
+                    if endConn then endConn:Disconnect() end
+                end
+            end)
+        end
+    end))
+    addConnection(handle.InputChanged:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch then
+            dragInput = input
+        end
+    end))
+    addConnection(UserInputService.InputChanged:Connect(function(input)
+        if input == dragInput and dragging then
+            local delta = input.Position - dragStart
+            gui.Position = UDim2.new(
+                startPos.X.Scale, startPos.X.Offset + delta.X,
+                startPos.Y.Scale, startPos.Y.Offset + delta.Y
+            )
+        end
+    end))
+end
 
+-- Top bar
 local TopBar = Instance.new("Frame")
-TopBar.Size = UDim2.new(1, 0, 0, 40)
+TopBar.Size = UDim2.new(1, 0, 0, 44)
 TopBar.BackgroundTransparency = 1
 TopBar.Parent = MainFrame
 
 local Title = Instance.new("TextLabel")
-Title.Size = UDim2.new(0, 150, 1, 0)
+Title.Size = UDim2.new(0, 200, 1, 0)
 Title.Position = UDim2.new(0, 15, 0, 0)
 Title.BackgroundTransparency = 1
 Title.Text = "Autofarm"
@@ -276,99 +341,110 @@ Title.TextXAlignment = Enum.TextXAlignment.Left
 Title.Parent = TopBar
 
 local CloseBtn = Instance.new("TextButton")
-CloseBtn.Size = UDim2.new(0, 30, 0, 30)
-CloseBtn.Position = UDim2.new(1, -40, 0.5, -15)
+CloseBtn.Size = UDim2.new(0, 40, 0, 40)
+CloseBtn.Position = UDim2.new(1, -46, 0.5, -20)
 CloseBtn.BackgroundColor3 = Theme.Card
 CloseBtn.Text = "X"
 CloseBtn.TextColor3 = Theme.Text
 CloseBtn.Font = Enum.Font.GothamBold
-CloseBtn.TextSize = 14
+CloseBtn.TextSize = 16
+CloseBtn.AutoButtonColor = true
 CloseBtn.Parent = TopBar
-Instance.new("UICorner", CloseBtn).CornerRadius = UDim.new(0, 4)
+Instance.new("UICorner", CloseBtn).CornerRadius = UDim.new(0, 6)
 
-local Sidebar = Instance.new("Frame")
-Sidebar.Size = UDim2.new(0, 160, 1, -50)
-Sidebar.Position = UDim2.new(0, 10, 0, 45)
-Sidebar.BackgroundColor3 = Theme.Sidebar
-Sidebar.BorderSizePixel = 0
-Sidebar.Parent = MainFrame
-Instance.new("UICorner", Sidebar).CornerRadius = UDim.new(0, 6)
+makeDraggable(MainFrame, TopBar)
 
-local Logo = Instance.new("TextLabel")
-Logo.Size = UDim2.new(1, -20, 0, 40)
-Logo.Position = UDim2.new(0, 10, 0, 5)
-Logo.BackgroundTransparency = 1
-Logo.Text = "Jolo Hub"
-Logo.TextColor3 = Theme.Text
-Logo.Font = Enum.Font.GothamBold
-Logo.TextSize = 18
-Logo.TextXAlignment = Enum.TextXAlignment.Left
-Logo.Parent = Sidebar
+-- Sidebar (desktop only)
+if SHOW_SIDEBAR then
+    local Sidebar = Instance.new("Frame")
+    Sidebar.Size = UDim2.new(0, SIDEBAR_W, 1, -54)
+    Sidebar.Position = UDim2.new(0, 10, 0, 48)
+    Sidebar.BackgroundColor3 = Theme.Sidebar
+    Sidebar.BorderSizePixel = 0
+    Sidebar.Parent = MainFrame
+    Instance.new("UICorner", Sidebar).CornerRadius = UDim.new(0, 6)
 
-local VersionTag = Instance.new("TextLabel")
-VersionTag.Size = UDim2.new(0, 30, 0, 15)
-VersionTag.Position = UDim2.new(0, 80, 0, 12)
-VersionTag.BackgroundColor3 = Theme.Accent
-VersionTag.Text = "v1.0"
-VersionTag.TextColor3 = Color3.new(0, 0, 0)
-VersionTag.Font = Enum.Font.GothamBold
-VersionTag.TextSize = 9
-VersionTag.Parent = Logo
-Instance.new("UICorner", VersionTag).CornerRadius = UDim.new(0, 4)
+    local Logo = Instance.new("TextLabel")
+    Logo.Size = UDim2.new(1, -20, 0, 40)
+    Logo.Position = UDim2.new(0, 10, 0, 5)
+    Logo.BackgroundTransparency = 1
+    Logo.Text = "Jolo Hub"
+    Logo.TextColor3 = Theme.Text
+    Logo.Font = Enum.Font.GothamBold
+    Logo.TextSize = 18
+    Logo.TextXAlignment = Enum.TextXAlignment.Left
+    Logo.Parent = Sidebar
 
-local SidebarList = Instance.new("Frame")
-SidebarList.Size = UDim2.new(1, 0, 1, -50)
-SidebarList.Position = UDim2.new(0, 0, 0, 50)
-SidebarList.BackgroundTransparency = 1
-SidebarList.Parent = Sidebar
-local ListLayout = Instance.new("UIListLayout")
-ListLayout.Padding = UDim.new(0, 2)
-ListLayout.SortOrder = Enum.SortOrder.LayoutOrder
-ListLayout.Parent = SidebarList
+    local VersionTag = Instance.new("TextLabel")
+    VersionTag.Size = UDim2.new(0, 34, 0, 16)
+    VersionTag.Position = UDim2.new(0, 88, 0, 12)
+    VersionTag.BackgroundColor3 = Theme.Accent
+    VersionTag.Text = "v1.1"
+    VersionTag.TextColor3 = Color3.new(0, 0, 0)
+    VersionTag.Font = Enum.Font.GothamBold
+    VersionTag.TextSize = 10
+    VersionTag.Parent = Logo
+    Instance.new("UICorner", VersionTag).CornerRadius = UDim.new(0, 4)
 
-local function CreateSidebarButton(text, isCategory, isActive)
-    local btn = Instance.new("TextButton")
-    btn.Size = UDim2.new(1, 0, 0, 30)
-    btn.BackgroundColor3 = isActive and Theme.Card or Theme.Sidebar
-    btn.BackgroundTransparency = 1
-    btn.Text = isCategory and ("  " .. text) or ("    " .. text)
-    btn.TextColor3 = isActive and Theme.Accent or (isCategory and Theme.Text or Theme.SubText)
-    btn.Font = isCategory and Enum.Font.GothamBold or Enum.Font.Gotham
-    btn.TextSize = isCategory and 12 or 13
-    btn.TextXAlignment = Enum.TextXAlignment.Left
-    btn.Parent = SidebarList
-    if isActive then
-        local indicator = Instance.new("Frame")
-        indicator.Size = UDim2.new(0, 2, 1, 0)
-        indicator.BackgroundColor3 = Theme.Accent
-        indicator.BorderSizePixel = 0
-        indicator.Parent = btn
+    local SidebarList = Instance.new("Frame")
+    SidebarList.Size = UDim2.new(1, 0, 1, -50)
+    SidebarList.Position = UDim2.new(0, 0, 0, 50)
+    SidebarList.BackgroundTransparency = 1
+    SidebarList.Parent = Sidebar
+    local ListLayout = Instance.new("UIListLayout")
+    ListLayout.Padding = UDim.new(0, 2)
+    ListLayout.SortOrder = Enum.SortOrder.LayoutOrder
+    ListLayout.Parent = SidebarList
+
+    local function CreateSidebarButton(text, isCategory, isActive)
+        local btn = Instance.new("TextButton")
+        btn.Size = UDim2.new(1, 0, 0, 32)
+        btn.BackgroundTransparency = 1
+        btn.Text = isCategory and ("  " .. text) or ("    " .. text)
+        btn.TextColor3 = isActive and Theme.Accent or (isCategory and Theme.Text or Theme.SubText)
+        btn.Font = isCategory and Enum.Font.GothamBold or Enum.Font.Gotham
+        btn.TextSize = isCategory and 12 or 13
+        btn.TextXAlignment = Enum.TextXAlignment.Left
+        btn.Parent = SidebarList
+        if isActive then
+            local indicator = Instance.new("Frame")
+            indicator.Size = UDim2.new(0, 2, 1, 0)
+            indicator.BackgroundColor3 = Theme.Accent
+            indicator.BorderSizePixel = 0
+            indicator.Parent = btn
+        end
     end
+
+    CreateSidebarButton("MAIN", true, false)
+    CreateSidebarButton("Home", false, false)
+    CreateSidebarButton("Kaitun", false, false)
+    CreateSidebarButton("Autofarm", false, true)
+    CreateSidebarButton("FARMING", true, false)
+    CreateSidebarButton("Missions", false, false)
 end
 
-CreateSidebarButton("MAIN", true, false)
-CreateSidebarButton("Home", false, false)
-CreateSidebarButton("Kaitun", false, false)
-CreateSidebarButton("Autofarm", false, true)
-CreateSidebarButton("FARMING", true, false)
-CreateSidebarButton("Missions", false, false)
-
+-- Content
 local ContentArea = Instance.new("ScrollingFrame")
-ContentArea.Size = UDim2.new(1, -190, 1, -50)
-ContentArea.Position = UDim2.new(0, 180, 0, 45)
+ContentArea.Size = UDim2.new(1, -(SIDEBAR_W + 20), 1, -54)
+ContentArea.Position = UDim2.new(0, SIDEBAR_W + 10, 0, 48)
 ContentArea.BackgroundTransparency = 1
 ContentArea.BorderSizePixel = 0
-ContentArea.ScrollBarThickness = 4
+ContentArea.ScrollBarThickness = 6
 ContentArea.ScrollBarImageColor3 = Theme.Line
+ContentArea.ScrollingDirection = Enum.ScrollingDirection.Y
+ContentArea.CanvasSize = UDim2.new(0, 0, 0, 0)
+ContentArea.AutomaticCanvasSize = Enum.AutomaticSize.Y
 ContentArea.Parent = MainFrame
+
 local ContentLayout = Instance.new("UIListLayout")
 ContentLayout.Padding = UDim.new(0, 10)
 ContentLayout.SortOrder = Enum.SortOrder.LayoutOrder
 ContentLayout.Parent = ContentArea
 
-local function CreateCard(titleText, height)
+local function CreateCard(titleText, toggleCount)
+    local height = 45 + toggleCount * (ROW_H + 6)
     local card = Instance.new("Frame")
-    card.Size = UDim2.new(1, -10, 0, height or 150)
+    card.Size = UDim2.new(1, -6, 0, height)
     card.BackgroundColor3 = Theme.Background
     card.BorderSizePixel = 0
     card.Parent = ContentArea
@@ -378,7 +454,7 @@ local function CreateCard(titleText, height)
     stroke.Parent = card
     local title = Instance.new("TextLabel")
     title.Size = UDim2.new(1, -20, 0, 30)
-    title.Position = UDim2.new(0, 15, 0, 10)
+    title.Position = UDim2.new(0, 15, 0, 8)
     title.BackgroundTransparency = 1
     title.Text = titleText
     title.TextColor3 = Theme.Accent
@@ -388,119 +464,141 @@ local function CreateCard(titleText, height)
     title.Parent = card
     local line = Instance.new("Frame")
     line.Size = UDim2.new(1, -30, 0, 1)
-    line.Position = UDim2.new(0, 15, 0, 35)
+    line.Position = UDim2.new(0, 15, 0, 36)
     line.BackgroundColor3 = Theme.Line
     line.BorderSizePixel = 0
     line.Parent = card
     return card
 end
 
-local function CreateToggle(parent, nameText, descText, yPos, initialState, callback, validator)
-    local row = Instance.new("Frame")
-    row.Size = UDim2.new(1, -30, 0, 35)
-    row.Position = UDim2.new(0, 15, 0, yPos)
+local function CreateToggle(parent, nameText, descText, yPos, initialState, callback)
+    local row = Instance.new("TextButton")
+    row.Size = UDim2.new(1, -20, 0, ROW_H)
+    row.Position = UDim2.new(0, 10, 0, yPos)
     row.BackgroundTransparency = 1
-    row.Active = true
+    row.AutoButtonColor = false
+    row.Text = ""
     row.Parent = parent
 
     local name = Instance.new("TextLabel")
-    name.Size = UDim2.new(1, -50, 0, 15)
+    name.Size = UDim2.new(1, -70, 0, 20)
+    name.Position = UDim2.new(0, 8, 0, (isMobile and 8) or 4)
     name.BackgroundTransparency = 1
     name.Text = nameText
     name.TextColor3 = Theme.Text
     name.Font = Enum.Font.Gotham
-    name.TextSize = 13
+    name.TextSize = isMobile and 15 or 14
     name.TextXAlignment = Enum.TextXAlignment.Left
     name.Parent = row
 
     local desc = Instance.new("TextLabel")
-    desc.Size = UDim2.new(1, -50, 0, 15)
-    desc.Position = UDim2.new(0, 0, 0, 15)
+    desc.Size = UDim2.new(1, -70, 0, 16)
+    desc.Position = UDim2.new(0, 8, 0, (isMobile and 28) or 22)
     desc.BackgroundTransparency = 1
     desc.Text = descText
     desc.TextColor3 = Theme.SubText
     desc.Font = Enum.Font.Gotham
-    desc.TextSize = 11
+    desc.TextSize = isMobile and 12 or 11
     desc.TextXAlignment = Enum.TextXAlignment.Left
     desc.Parent = row
 
     local state = initialState and true or false
 
+    local SW_W = isMobile and 46 or 36
+    local SW_H = isMobile and 22 or 18
+    local DOT = isMobile and 18 or 14
+
     local switchBg = Instance.new("Frame")
-    switchBg.Size = UDim2.new(0, 36, 0, 18)
-    switchBg.Position = UDim2.new(1, -36, 0, 5)
+    switchBg.Size = UDim2.new(0, SW_W, 0, SW_H)
+    switchBg.Position = UDim2.new(1, -(SW_W + 8), 0.5, -SW_H / 2)
     switchBg.BackgroundColor3 = state and Theme.Accent or Theme.ToggleOff
     switchBg.Parent = row
     Instance.new("UICorner", switchBg).CornerRadius = UDim.new(1, 0)
 
     local switchDot = Instance.new("Frame")
-    switchDot.Size = UDim2.new(0, 14, 0, 14)
-    switchDot.Position = state and UDim2.new(1, -16, 0.5, -7) or UDim2.new(0, 2, 0.5, -7)
+    switchDot.Size = UDim2.new(0, DOT, 0, DOT)
+    switchDot.Position = state
+        and UDim2.new(1, -(DOT + 2), 0.5, -DOT / 2)
+        or UDim2.new(0, 2, 0.5, -DOT / 2)
     switchDot.BackgroundColor3 = Theme.Background
     switchDot.Parent = switchBg
     Instance.new("UICorner", switchDot).CornerRadius = UDim.new(1, 0)
 
     local function render()
         switchBg.BackgroundColor3 = state and Theme.Accent or Theme.ToggleOff
-        switchDot.Position = state and UDim2.new(1, -16, 0.5, -7) or UDim2.new(0, 2, 0.5, -7)
+        switchDot.Position = state
+            and UDim2.new(1, -(DOT + 2), 0.5, -DOT / 2)
+            or UDim2.new(0, 2, 0.5, -DOT / 2)
     end
 
-    addConnection(row.InputBegan:Connect(function(input)
-        if input.UserInputType ~= Enum.UserInputType.MouseButton1 and input.UserInputType ~= Enum.UserInputType.Touch then return end
-        local next = not state
-        if validator and not validator(next) then return end
-        state = next
+    row.MouseButton1Click:Connect(function()
+        state = not state
         render()
-        if callback then callback(state) end
-    end))
+        if callback then pcall(callback, state) end
+    end)
 end
 
 -- FARM
-local FarmCard = CreateCard("✦ FARM", 150)
-CreateToggle(FarmCard, "Auto farm", "The main switch. Farms every titan for you.", 45, CONFIG.KillAura,
+local FarmCard = CreateCard("✦ FARM", 2)
+CreateToggle(FarmCard, "Kill Aura", "Faces and swings at the nearest titan.", 44, CONFIG.KillAura,
     function(v) CONFIG.KillAura = v end)
-CreateToggle(FarmCard, "Auto reload blades", "Reloads your blades automatically when empty.", 85, CONFIG.AutoReloadBlades,
+CreateToggle(FarmCard, "Auto Reload Blades", "Re-equips your blade to trigger reload.", 44 + ROW_H + 6, CONFIG.AutoReloadBlades,
     function(v) CONFIG.AutoReloadBlades = v end)
 
--- MISC
-local MiscCard = CreateCard("✦ MISC", 150)
-CreateToggle(MiscCard, "Auto refill gas", "Refills your gas tanks automatically.", 45, CONFIG.AutoRefillGas,
-    function(v) CONFIG.AutoRefillGas = v end)
-CreateToggle(MiscCard, "Anti-AFK", "Prevents being kicked for inactivity.", 85, CONFIG.AntiAFK,
-    function(v)
-        CONFIG.AntiAFK = v
-        if v then applyAntiAFK() end
-    end,
-    function(v)
-        if v and not hasGetConnections then
-            warn("[AOTR] getconnections unavailable - Anti-AFK cannot be enabled.")
-            return false
-        end
-        return true
-    end)
-
--- ODM
-local ODMCard = CreateCard("✦ ODM", 250)
-CreateToggle(ODMCard, "Infinite gas", "Keeps your gas tanks topped up.", 45, CONFIG.InfiniteGas,
-    function(v) CONFIG.InfiniteGas = v end)
-CreateToggle(ODMCard, "Infinite boost", "Keeps your boost stat topped up.", 85, CONFIG.InfiniteBoost,
-    function(v) CONFIG.InfiniteBoost = v end)
-CreateToggle(ODMCard, "No hook cooldown", "Removes the hook cooldown attribute.", 125, CONFIG.NoHookCooldown,
-    function(v) CONFIG.NoHookCooldown = v end)
-CreateToggle(ODMCard, "Instant hook", "Sets your hook speed high.", 165, CONFIG.InstantHook,
-    function(v) CONFIG.InstantHook = v end)
-
 -- VISUALS
-local VisualCard = CreateCard("✦ VISUALS", 120)
-CreateToggle(VisualCard, "Titan ESP", "Draws a box around every titan.", 45, CONFIG.TitanESP,
-    function(v) CONFIG.TitanESP = v end,
-    function(v)
-        if v and not hasDrawing then
-            warn("[AOTR] Drawing API unavailable - Titan ESP cannot be enabled.")
-            return false
-        end
-        return true
+local VisualCard = CreateCard("✦ VISUALS", 1)
+CreateToggle(VisualCard, "Titan ESP", "Name tags over every titan.", 44, CONFIG.TitanESP,
+    function(v) CONFIG.TitanESP = v end)
+
+-- UTILITY
+local UtilCard = CreateCard("✦ UTILITY", 1)
+CreateToggle(UtilCard, "Anti-AFK", "Prevents idle kick via VirtualUser.", 44, CONFIG.AntiAFK,
+    function(v) CONFIG.AntiAFK = v end)
+
+-- ============================================================
+-- FLOAT BUTTON (mobile)
+-- ============================================================
+if isMobile then
+    local floatBtn = Instance.new("TextButton")
+    floatBtn.Size = UDim2.new(0, 56, 0, 56)
+    floatBtn.Position = UDim2.new(0, 16, 0.5, -28)
+    floatBtn.BackgroundColor3 = Theme.Accent
+    floatBtn.Text = "J"
+    floatBtn.TextColor3 = Color3.new(0, 0, 0)
+    floatBtn.Font = Enum.Font.GothamBold
+    floatBtn.TextSize = 22
+    floatBtn.Parent = ScreenGui
+    Instance.new("UICorner", floatBtn).CornerRadius = UDim.new(1, 0)
+
+    local startPos, startInputPos, dragging, moved, moveConn
+
+    floatBtn.InputBegan:Connect(function(input)
+        if input.UserInputType ~= Enum.UserInputType.Touch and input.UserInputType ~= Enum.UserInputType.MouseButton1 then return end
+        dragging = true
+        moved = false
+        startPos = floatBtn.Position
+        startInputPos = input.Position
+        if moveConn then moveConn:Disconnect() end
+        moveConn = input.Changed:Connect(function()
+            if input.UserInputState == Enum.UserInputState.Change and dragging then
+                local delta = input.Position - startInputPos
+                if delta.Magnitude > 8 then moved = true end
+                if moved then
+                    floatBtn.Position = UDim2.new(
+                        startPos.X.Scale, startPos.X.Offset + delta.X,
+                        startPos.Y.Scale, startPos.Y.Offset + delta.Y
+                    )
+                end
+            elseif input.UserInputState == Enum.UserInputState.End then
+                dragging = false
+                if not moved then
+                    MainFrame.Visible = not MainFrame.Visible
+                end
+                if moveConn then moveConn:Disconnect() end
+            end
+        end)
     end)
+end
 
 -- ============================================================
 -- CLEANUP
@@ -510,14 +608,9 @@ local function unload()
     Unloaded = true
     CONFIG.Enabled = false
 
-    for _, name in ipairs(RenderBindings) do
-        pcall(function() RunService:UnbindFromRenderStep(name) end)
-    end
+    clearESP()
     for _, c in ipairs(Connections) do
         pcall(function() c:Disconnect() end)
-    end
-    for _, d in ipairs(Drawings) do
-        pcall(function() d:Remove() end)
     end
     if ScreenGui then ScreenGui:Destroy() end
     if getgenv().AOTR_JoloHub_Unload == unload then
@@ -529,24 +622,23 @@ end
 getgenv().AOTR_JoloHub_Unload = unload
 
 CloseBtn.MouseButton1Click:Connect(function()
-    unload()
+    MainFrame.Visible = false
 end)
 
 addConnection(UserInputService.InputBegan:Connect(function(input, gp)
     if gp then return end
     if input.KeyCode == Enum.KeyCode.F2 then unload() end
+    if input.KeyCode == Enum.KeyCode.F1 then
+        MainFrame.Visible = not MainFrame.Visible
+    end
 end))
 
 -- ============================================================
 -- STARTUP
 -- ============================================================
-addRender("AOTR_ESP", Enum.RenderPriority.Camera.Value + 1, updateESP)
-addRender("AOTR_ODM", Enum.RenderPriority.Camera.Value + 2, updateODM)
-
 task.spawn(killAuraLoop)
-task.spawn(refillLoop)
 task.spawn(reloadLoop)
+task.spawn(espLoop)
+setupAntiAFK()
 
-if CONFIG.AntiAFK then applyAntiAFK() end
-
-print("[AOTR] Jolo Hub loaded. Close button or F2 unloads.")
+print("[AOTR] Jolo Hub loaded. Mobile:", isMobile)
